@@ -299,9 +299,17 @@ class PPO:
                 self.reduce_parameters()
 
             # Apply the gradients for PPO
-            nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-            nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+            # Note: Modular-norm models dualize their gradients instead of clipping them and project their weights
+            # back onto the constraint manifold after the optimizer step.
+            for model in (self.actor, self.critic):
+                if hasattr(model, "dualize_gradients"):
+                    model.dualize_gradients()
+                else:
+                    nn.utils.clip_grad_norm_(model.parameters(), self.max_grad_norm)
             self.optimizer.step()
+            for model in (self.actor, self.critic):
+                if hasattr(model, "project_weights"):
+                    model.project_weights()
             # Apply the gradients for RND
             if self.rnd:
                 self.rnd.optimizer.step()

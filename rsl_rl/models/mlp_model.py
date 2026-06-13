@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
-from rsl_rl.modules import MLP, EmpiricalNormalization, HiddenState
+from rsl_rl.modules import MLP, EmpiricalNormalization, HiddenState, ModularNormMLP
 from rsl_rl.modules.distribution import Distribution
 from rsl_rl.utils import resolve_callable, unpad_trajectories
 
@@ -37,6 +37,7 @@ class MLPModel(nn.Module):
         activation: str = "elu",
         obs_normalization: bool = False,
         distribution_cfg: dict | None = None,
+        modular_norm: bool = False,
     ) -> None:
         """Initialize the MLP-based model.
 
@@ -50,6 +51,8 @@ class MLPModel(nn.Module):
             obs_normalization: Whether to normalize the observations before feeding them to the MLP.
             distribution_cfg: Configuration dictionary for the output distribution. If provided, the model outputs
                 stochastic values sampled from the distribution.
+            modular_norm: Whether to use a modular-norm MLP (see :class:`~rsl_rl.modules.ModularNormMLP`). The
+                learning algorithm dualizes the gradients and projects the weights instead of clipping the gradients.
         """
         super().__init__()
 
@@ -73,11 +76,17 @@ class MLPModel(nn.Module):
             mlp_output_dim = output_dim
 
         # MLP
-        self.mlp = MLP(self._get_latent_dim(), mlp_output_dim, hidden_dims, activation)
+        mlp_class = ModularNormMLP if modular_norm else MLP
+        self.mlp = mlp_class(self._get_latent_dim(), mlp_output_dim, hidden_dims, activation)
 
-        # Initialize distribution-specific MLP weights
-        if self.distribution is not None:
+        # Initialize distribution-specific MLP weights (the modular-norm MLP keeps its own manifold initialization)
+        if self.distribution is not None and not modular_norm:
             self.distribution.init_mlp_weights(self.mlp)
+
+        # Expose the modular-norm operations for the learning algorithm (presence is duck-typed in the algorithm)
+        if modular_norm:
+            self.dualize_gradients = self.mlp.dualize_gradients
+            self.project_weights = self.mlp.project_weights
 
     def forward(
         self,
