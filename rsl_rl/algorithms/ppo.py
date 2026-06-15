@@ -346,10 +346,15 @@ class PPO:
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
 
+        # Adapter diagnostics (LoRA): per-layer norms (separate from losses)
+        info_dict = {}
+        if hasattr(self.actor, "adapter_diagnostics"):
+            info_dict.update(self.actor.adapter_diagnostics())
+
         # Clear the storage
         self.storage.clear()
 
-        return loss_dict
+        return loss_dict, info_dict
 
     def train_mode(self) -> None:
         """Set train mode for learnable models."""

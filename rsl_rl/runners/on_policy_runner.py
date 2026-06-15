@@ -105,7 +105,7 @@ class OnPolicyRunner:
                 self.alg.compute_returns(obs)
 
             # Update policy
-            loss_dict = self.alg.update()
+            loss_dict, info_dict = self.alg.update()
 
             stop = time.time()
             learn_time = stop - start
@@ -119,6 +119,7 @@ class OnPolicyRunner:
                 collect_time=collect_time,
                 learn_time=learn_time,
                 loss_dict=loss_dict,
+                info_dict=info_dict,
                 learning_rate=self.alg.learning_rate,
                 action_std=self.alg.get_policy().output_std,
                 rnd_weight=self.alg.rnd.weight if self.cfg["algorithm"]["rnd_cfg"] else None,

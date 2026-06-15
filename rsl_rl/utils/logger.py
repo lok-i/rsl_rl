@@ -164,6 +164,7 @@ class Logger:
         learning_rate: float,
         action_std: torch.Tensor,
         rnd_weight: float | None,
+        info_dict: dict | None = None,
         print_minimal: bool = False,
         width: int = 80,
         pad: int = 40,
@@ -206,6 +207,11 @@ class Logger:
             for key, value in loss_dict.items():
                 self.writer.add_scalar(f"Loss/{key}", value, it)
             self.writer.add_scalar("Loss/learning_rate", learning_rate, it)
+
+            # Log info (adapter stats, etc.) — keys already contain their TB section prefix
+            if info_dict:
+                for key, value in info_dict.items():
+                    self.writer.add_scalar(key, value, it)
 
             # Log std
             self.writer.add_scalar("Policy/mean_std", action_std.mean().item(), it)
@@ -251,6 +257,11 @@ class Logger:
             # Print losses
             for key, value in loss_dict.items():
                 log_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
+
+            # Print info (adapter stats, etc.)
+            if info_dict:
+                for key, value in info_dict.items():
+                    log_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
 
             # Print rewards and episode length
             if len(self.rewbuffer) > 0:
