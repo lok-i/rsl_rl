@@ -9,28 +9,24 @@ from __future__ import annotations
 import torch
 from tensordict import TensorDict
 
-from rsl_rl.modules import EmpiricalNormalization, HiddenState, ModularNormMLPWithAdapter
+from rsl_rl.modules import EmpiricalNormalization, HiddenState, MLPWithAdapter, ModularNormMLPWithAdapter
 
 from .mlp_model import MLPModel
 
 
 class MLPWithAdapterModel(MLPModel):
-    """An :class:`MLPModel` whose MLP is a frozen base with a trainable LoRA adapter (:class:`MLPWithAdapter`).
+    """An :class:`MLPModel` with a frozen MLP base and trainable LoRA adapters.
 
-    The base is a pretrained, frozen policy (e.g. the TextOp WBC); only the strapped adapters are trained.
     Two observation streams feed the network:
 
-    - **base stream** -- the standard ``obs_groups[obs_set]`` groups, normalized by the (frozen) base
-      normalizer and fed to the frozen base layers. For the WBC this is its exact training observation.
-    - **adapter stream** -- a separate ``adapter_obs_group`` (e.g. object state), normalized by its own
-      (trainable) normalizer and fed to the input adapter. This is the new conditioning signal.
+    - **base stream** -- ``obs_groups[obs_set]``, normalized by the (frozen) base normalizer.
+    - **adapter stream** -- ``adapter_obs_group`` (e.g. object state), with its own trainable normalizer.
 
-    The base weights and the base observation normalizer are frozen (the WBC must keep seeing its trained
-    input distribution); only the adapters and the adapter normalizer learn. The modular-norm
-    ``dualize_gradients`` / ``project_weights`` hooks are intentionally NOT exposed: the base is off its
-    spectral manifold (TextOp trained dualize-only), so projecting it every step would destroy it -- the
-    free-Adam adapters need neither hook.
+    Subclass :class:`ModularNormMLPWithAdapterModel` when the frozen base is a ``ModularNormMLP``.
     """
+
+    _adapter_cls: type[MLPWithAdapter] = MLPWithAdapter
+    """Adapter module class. Mirrors the module-layer split."""
 
     def __init__(
         self,
@@ -47,24 +43,6 @@ class MLPWithAdapterModel(MLPModel):
         alpha: float = 1.0,
         wbc_checkpoint: str | None = None,
     ) -> None:
-        """Initialize the model, load + freeze the base, and strap a zero-init adapter on it.
-
-        Args:
-            obs: Observation TensorDict (used to size the base and adapter streams).
-            obs_groups: Mapping of observation sets to groups. ``obs_groups[obs_set]`` is the base stream.
-            obs_set: Observation set for this model (``"actor"``).
-            output_dim: Action dimension.
-            hidden_dims: Hidden dims of the base MLP (must match the pretrained base, e.g. the WBC).
-            activation: Activation of the base MLP (the WBC uses ``elu``).
-            obs_normalization: Normalize both streams (required to load a checkpoint's base normalizer).
-            distribution_cfg: Output distribution config (Gaussian for PPO).
-            adapter_obs_group: Name of the observation group feeding the adapter (e.g. object state).
-            rank: Adapter rank, scalar or per-layer list (see :class:`~rsl_rl.modules.Adapter`).
-            alpha: Adapter scale.
-            wbc_checkpoint: Path to a pretrained base checkpoint (a ``*_ported.pt`` payload or a raw state
-                dict). Loaded into the base before strapping, so the adapted model starts as the base.
-        """
-        # The base (WBC) is a modular-norm MLP; build it as such, then strap the adapter on top.
         super().__init__(
             obs=obs,
             obs_groups=obs_groups,
@@ -74,11 +52,9 @@ class MLPWithAdapterModel(MLPModel):
             activation=activation,
             obs_normalization=obs_normalization,
             distribution_cfg=distribution_cfg,
-            modular_norm=True,
         )
 
-        # Load the pretrained base (weights + base normalizer + action std) BEFORE strapping: at this point
-        # ``self.mlp`` is still a plain ModularNormMLP whose keys match the checkpoint.
+        # Load pretrained base BEFORE strapping (self.mlp is still a plain MLP whose keys match).
         if wbc_checkpoint is not None:
             if not obs_normalization:
                 raise ValueError("wbc_checkpoint requires obs_normalization=True to load the base normalizer.")
@@ -89,31 +65,33 @@ class MLPWithAdapterModel(MLPModel):
             if unexpected:
                 raise RuntimeError(f"wbc_checkpoint has unexpected keys: {unexpected}")
 
-        # Adapter stream: separate group + its own (trainable) normalizer.
+        # Adapter stream: separate obs group + its own (trainable) normalizer.
         self.adapter_obs_groups = [adapter_obs_group]
         adapter_dim = self._concat_dim(obs, self.adapter_obs_groups)
         self.adapter_normalizer = EmpiricalNormalization(adapter_dim) if obs_normalization else torch.nn.Identity()
 
-        # Strap the adapter on the (now loaded) frozen base. The input adapter takes the adapter stream.
-        self.mlp = ModularNormMLPWithAdapter.from_base_mlp(
+        # Strap adapter on the (now loaded) frozen base.
+        self.mlp = self._adapter_cls.from_base_mlp(
             self.mlp, adapter_input_dim=adapter_dim, rank=rank, alpha=alpha
         )
 
-        # Drop the modular-norm hooks: the frozen base must never be dualized/projected (it is off its
-        # spectral manifold), and the free-Adam adapters do not use them. Their absence makes the PPO loop
-        # fall through to plain grad-clip + Adam on the trainable (adapter) params.
-        del self.dualize_gradients
-        del self.project_weights
+        # Remove modular-norm hooks if present: a frozen off-manifold base must never be
+        # dualized/projected, and free-Adam adapters need neither hook.
+        for hook in ("dualize_gradients", "project_weights"):
+            if hasattr(self, hook):
+                delattr(self, hook)
+
+    # --- helpers ---
 
     @staticmethod
     def _concat_dim(obs: TensorDict, groups: list[str]) -> int:
-        """Total feature dimension of the concatenated ``groups``."""
         return sum(obs[group].shape[-1] for group in groups)
 
     def _get_adapter_latent(self, obs: TensorDict) -> torch.Tensor:
-        """Concatenate and normalize the adapter observation stream."""
         latent = torch.cat([obs[group] for group in self.adapter_obs_groups], dim=-1)
         return self.adapter_normalizer(latent)
+
+    # --- overrides ---
 
     def forward(
         self,
@@ -122,7 +100,6 @@ class MLPWithAdapterModel(MLPModel):
         hidden_state: HiddenState = None,
         stochastic_output: bool = False,
     ) -> torch.Tensor:
-        """Forward pass: frozen base on the base stream, adapter on the adapter stream."""
         base_latent = self.get_latent(obs, masks, hidden_state)
         adapter_latent = self._get_adapter_latent(obs)
         mlp_output = self.mlp(base_latent, adapter_latent)
@@ -134,15 +111,34 @@ class MLPWithAdapterModel(MLPModel):
         return mlp_output
 
     def update_normalization(self, obs: TensorDict) -> None:
-        """Update only the adapter normalizer; the base normalizer stays frozen (WBC's trained stats)."""
+        """Update only the adapter normalizer; base normalizer stays frozen."""
         if self.obs_normalization:
             latent = torch.cat([obs[group] for group in self.adapter_obs_groups], dim=-1)
             self.adapter_normalizer.update(latent)  # type: ignore
 
+    def adapter_diagnostics(self) -> dict[str, float]:
+        """Per-layer adapter weight norms under ``AdapterStats/``."""
+        diag: dict[str, float] = {}
+        for i, adapter in enumerate(self.mlp.adapters):
+            diag[f"AdapterStats/layer_{i}_delta_w_norm"] = adapter.delta_weight().norm().item()
+        return diag
+
     def as_jit(self) -> torch.nn.Module:
-        """JIT export is not yet supported for the two-stream adapter model."""
         raise NotImplementedError("JIT export for MLPWithAdapterModel is not implemented yet.")
 
     def as_onnx(self, verbose: bool) -> torch.nn.Module:
-        """ONNX export is not yet supported for the two-stream adapter model."""
         raise NotImplementedError("ONNX export for MLPWithAdapterModel is not implemented yet.")
+
+
+class ModularNormMLPWithAdapterModel(MLPWithAdapterModel):
+    """An :class:`MLPWithAdapterModel` whose frozen base is a :class:`~rsl_rl.modules.ModularNormMLP`.
+
+    Used to adapt the bias-free, modular-norm TextOp WBC. The adapters themselves are plain
+    free-Adam :class:`~rsl_rl.modules.Adapter` modules (no spectral constraint).
+    """
+
+    _adapter_cls = ModularNormMLPWithAdapter
+
+    def _make_mlp(self, input_dim, output_dim, hidden_dims, activation):
+        from rsl_rl.modules import ModularNormMLP
+        return ModularNormMLP(input_dim, output_dim, hidden_dims, activation)

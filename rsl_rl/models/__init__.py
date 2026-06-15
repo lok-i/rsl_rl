@@ -15,5 +15,6 @@ __all__ = [
     "MLPModel",
     "ModularNormMLPModel",
     "MLPWithAdapterModel",
+    "ModularNormMLPWithAdapterModel",
     "RNNModel",
 ]
