@@ -37,7 +37,6 @@ class MLPModel(nn.Module):
         activation: str = "elu",
         obs_normalization: bool = False,
         distribution_cfg: dict | None = None,
-        modular_norm: bool = False,
     ) -> None:
         """Initialize the MLP-based model.
 
@@ -51,8 +50,6 @@ class MLPModel(nn.Module):
             obs_normalization: Whether to normalize the observations before feeding them to the MLP.
             distribution_cfg: Configuration dictionary for the output distribution. If provided, the model outputs
                 stochastic values sampled from the distribution.
-            modular_norm: Whether to use a modular-norm MLP (see :class:`~rsl_rl.modules.ModularNormMLP`). The
-                learning algorithm dualizes the gradients and projects the weights instead of clipping the gradients.
         """
         super().__init__()
 
@@ -75,18 +72,15 @@ class MLPModel(nn.Module):
             self.distribution = None
             mlp_output_dim = output_dim
 
-        # MLP
-        mlp_class = ModularNormMLP if modular_norm else MLP
-        self.mlp = mlp_class(self._get_latent_dim(), mlp_output_dim, hidden_dims, activation)
+        # MLP (subclasses override _make_mlp to change the MLP type)
+        self.mlp = self._make_mlp(self._get_latent_dim(), mlp_output_dim, hidden_dims, activation)
 
-        # Initialize distribution-specific MLP weights (the modular-norm MLP keeps its own manifold initialization)
-        if self.distribution is not None and not modular_norm:
-            self.distribution.init_mlp_weights(self.mlp)
-
-        # Expose the modular-norm operations for the learning algorithm (presence is duck-typed in the algorithm)
-        if modular_norm:
-            self.dualize_gradients = self.mlp.dualize_gradients
-            self.project_weights = self.mlp.project_weights
+    def _make_mlp(self, input_dim: int, output_dim: int, hidden_dims, activation: str) -> MLP:
+        """Build and initialize the MLP. Subclasses override to change the MLP type."""
+        mlp = MLP(input_dim, output_dim, hidden_dims, activation)
+        if self.distribution is not None:
+            self.distribution.init_mlp_weights(mlp)
+        return mlp
 
     def forward(
         self,
@@ -200,6 +194,24 @@ class MLPModel(nn.Module):
     def _get_latent_dim(self) -> int:
         """Return the latent dimensionality consumed by the MLP head."""
         return self.obs_dim
+
+
+class ModularNormMLPModel(MLPModel):
+    """An :class:`MLPModel` whose MLP is a :class:`~rsl_rl.modules.ModularNormMLP`.
+
+    The learning algorithm dualizes the gradients and projects the weights onto the spectral-norm
+    constraint manifold instead of clipping gradients (duck-typed via ``dualize_gradients`` /
+    ``project_weights``).
+    """
+
+    def _make_mlp(self, input_dim: int, output_dim: int, hidden_dims, activation: str) -> ModularNormMLP:
+        """Build a ModularNormMLP. Skips distribution weight init (manifold has its own)."""
+        return ModularNormMLP(input_dim, output_dim, hidden_dims, activation)
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.dualize_gradients = self.mlp.dualize_gradients
+        self.project_weights = self.mlp.project_weights
 
 
 class _TorchMLPModel(nn.Module):
