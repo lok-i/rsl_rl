@@ -15,7 +15,7 @@ from .mlp_model import MLPModel
 
 
 class MLPWithAdapterModel(MLPModel):
-    """An :class:`MLPModel` with a frozen MLP base and trainable LoRA adapters.
+    """An :class:`MLPModel` with a pretrained MLP base and trainable adapters.
 
     Two observation streams feed the network:
 
@@ -39,9 +39,10 @@ class MLPWithAdapterModel(MLPModel):
         obs_normalization: bool = False,
         distribution_cfg: dict | None = None,
         adapter_obs_group: str = "adapter",
-        rank: int | list[int] = -1,
+        rank: int | list[int | None] = -1,
         alpha: float = 1.0,
         wbc_checkpoint: str | None = None,
+        freeze_base: bool = True,
     ) -> None:
         super().__init__(
             obs=obs,
@@ -70,16 +71,18 @@ class MLPWithAdapterModel(MLPModel):
         adapter_dim = self._concat_dim(obs, self.adapter_obs_groups)
         self.adapter_normalizer = EmpiricalNormalization(adapter_dim) if obs_normalization else torch.nn.Identity()
 
-        # Strap adapter on the (now loaded) frozen base.
+        # Strap adapter on the (now loaded) base.
         self.mlp = self._adapter_cls.from_base_mlp(
-            self.mlp, adapter_input_dim=adapter_dim, rank=rank, alpha=alpha
+            self.mlp, adapter_input_dim=adapter_dim, rank=rank, alpha=alpha, freeze_base=freeze_base
         )
 
-        # Remove modular-norm hooks if present: a frozen off-manifold base must never be
-        # dualized/projected, and free-Adam adapters need neither hook.
+        # Remove modular-norm hooks if present: the off-manifold base (frozen or fine-tuned with free-Adam)
+        # must never be dualized/projected, and adapters need neither hook.
         for hook in ("dualize_gradients", "project_weights"):
             if hasattr(self, hook):
                 delattr(self, hook)
+
+        self._print_param_summary(freeze_base)
 
     # --- helpers ---
 
@@ -90,6 +93,58 @@ class MLPWithAdapterModel(MLPModel):
     def _get_adapter_latent(self, obs: TensorDict) -> torch.Tensor:
         latent = torch.cat([obs[group] for group in self.adapter_obs_groups], dim=-1)
         return self.adapter_normalizer(latent)
+
+    def _print_param_summary(self, freeze_base: bool) -> None:
+        """Pretty-print per-component trainable / total param counts."""
+        def _count(module):
+            total = sum(p.numel() for p in module.parameters())
+            train = sum(p.numel() for p in module.parameters() if p.requires_grad)
+            return train, total
+
+        sep = "─" * 62
+        print(f"\n{sep}")
+        print(f"  MLPWithAdapterModel  (base {'frozen' if freeze_base else 'unfrozen'})")
+        print(sep)
+        print(f"  {'component':<28} {'trainable':>12} {'total':>12}")
+        print(f"  {'─'*28} {'─'*12} {'─'*12}")
+
+        grand_train, grand_total = 0, 0
+
+        # base layers
+        for i, linear in enumerate(self.mlp.base_linears):
+            tr, tot = _count(linear)
+            tag = "frozen" if not tr else ""
+            print(f"  base linear[{i}] {tag:<12} {tr:>12,} {tot:>12,}")
+            grand_train += tr; grand_total += tot
+
+        # adapters
+        for i, adapter in enumerate(self.mlp.adapters):
+            if adapter is not None:
+                tr, tot = _count(adapter)
+                print(f"  adapter[{i}]{'':16} {tr:>12,} {tot:>12,}")
+                grand_train += tr; grand_total += tot
+            else:
+                print(f"  adapter[{i}]{'':16} {'—':>12} {'—':>12}")
+
+        # normalizers
+        for name, mod in [("base normalizer", self.obs_normalizer), ("adapter normalizer", self.adapter_normalizer)]:
+            tr, tot = _count(mod)
+            if tot:
+                print(f"  {name:<28} {tr:>12,} {tot:>12,}")
+                grand_train += tr; grand_total += tot
+
+        # distribution (action std)
+        if self.distribution is not None:
+            tr, tot = _count(self.distribution)
+            if tot:
+                print(f"  {'distribution (std)':<28} {tr:>12,} {tot:>12,}")
+                grand_train += tr; grand_total += tot
+
+        print(f"  {'─'*28} {'─'*12} {'─'*12}")
+        print(f"  {'TOTAL':<28} {grand_train:>12,} {grand_total:>12,}")
+        pct = 100 * grand_train / grand_total if grand_total else 0
+        print(f"  trainable: {pct:.1f}%")
+        print(f"{sep}\n")
 
     # --- overrides ---
 
@@ -120,7 +175,8 @@ class MLPWithAdapterModel(MLPModel):
         """Per-layer adapter weight norms under ``AdapterStats/``."""
         diag: dict[str, float] = {}
         for i, adapter in enumerate(self.mlp.adapters):
-            diag[f"AdapterStats/layer_{i}_delta_w_norm"] = adapter.delta_weight().norm().item()
+            if adapter is not None:
+                diag[f"AdapterStats/layer_{i}_delta_w_norm"] = adapter.delta_weight().norm().item()
         return diag
 
     def as_jit(self) -> torch.nn.Module:
