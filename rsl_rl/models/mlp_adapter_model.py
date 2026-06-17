@@ -39,7 +39,7 @@ class MLPWithAdapterModel(MLPModel):
         activation: str = "elu",
         obs_normalization: bool = False,
         distribution_cfg: dict | None = None,
-        adapter_obs_group: str = "adapter",
+        adapter_obs_group: str = "augmentation",
         rank: int | list[int | None] = -1,
         alpha: float = 1.0,
         wbc_checkpoint: str | None = None,

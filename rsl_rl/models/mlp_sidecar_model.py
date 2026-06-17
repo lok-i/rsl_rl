@@ -39,7 +39,7 @@ class MLPWithSidecarModel(MLPModel):
         activation: str = "elu",
         obs_normalization: bool = False,
         distribution_cfg: dict | None = None,
-        sidecar_obs_group: str = "sidecar",
+        sidecar_obs_group: str = "augmentation",
         sidecar_hidden_dims: tuple[int, ...] | list[int] = (256,),
         sidecar_activation: str = "elu",
         wbc_checkpoint: str | None = None,
