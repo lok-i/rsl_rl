@@ -9,6 +9,7 @@ from .cnn import CNN
 from .distribution import BetaDistribution, Distribution, GaussianDistribution, HeteroscedasticGaussianDistribution
 from .mlp import MLP
 from .mlp_with_adapter import Adapter, MLPWithAdapter, ModularNormMLPWithAdapter
+from .mlp_with_sidecar import Sidecar, MLPWithSidecar, ModularNormMLPWithSidecar
 from .modular_norm_mlp import ModularNormMLP
 from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
 from .rnn import RNN, HiddenState
@@ -26,6 +27,9 @@ __all__ = [
     "HeteroscedasticGaussianDistribution",
     "HiddenState",
     "MLPWithAdapter",
+    "MLPWithSidecar",
     "ModularNormMLP",
     "ModularNormMLPWithAdapter",
+    "ModularNormMLPWithSidecar",
+    "Sidecar",
 ]

@@ -3,6 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+"""Adapter: per-layer weight-residual for base-policy adaptation (LoRA; Hu et al. 2021)."""
 
 from __future__ import annotations
 

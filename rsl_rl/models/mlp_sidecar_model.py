@@ -3,31 +3,31 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Adapter model: per-layer weight-residual for base-policy adaptation (LoRA; Hu et al. 2021)."""
+"""Sidecar model: per-network action-residual for base-policy adaptation (RPL; Tom Silver et al. 2018)."""
 
 from __future__ import annotations
 
 import torch
 from tensordict import TensorDict
 
-from rsl_rl.modules import EmpiricalNormalization, HiddenState, MLPWithAdapter, ModularNormMLPWithAdapter
+from rsl_rl.modules import EmpiricalNormalization, HiddenState, MLPWithSidecar, ModularNormMLPWithSidecar
 
 from .mlp_model import MLPModel
 
 
-class MLPWithAdapterModel(MLPModel):
-    """An :class:`MLPModel` with a pretrained MLP base and trainable adapters.
+class MLPWithSidecarModel(MLPModel):
+    """An :class:`MLPModel` with a pretrained MLP base and a trainable sidecar network.
 
     Two observation streams feed the network:
 
-    - **base stream** -- ``obs_groups[obs_set]``, normalized by the (frozen) base normalizer.
-    - **adapter stream** -- ``adapter_obs_group`` (e.g. object state), with its own trainable normalizer.
+    - **base stream** — ``obs_groups[obs_set]``, normalized by the (frozen) base normalizer.
+    - **sidecar stream** — ``sidecar_obs_group`` (e.g. object state), with its own trainable normalizer.
 
-    Subclass :class:`ModularNormMLPWithAdapterModel` when the frozen base is a ``ModularNormMLP``.
+    Subclass :class:`ModularNormMLPWithSidecarModel` when the frozen base is a ``ModularNormMLP``.
     """
 
-    _adapter_cls: type[MLPWithAdapter] = MLPWithAdapter
-    """Adapter module class. Mirrors the module-layer split."""
+    _sidecar_cls: type[MLPWithSidecar] = MLPWithSidecar
+    """Sidecar module class. Mirrors the module-layer split."""
 
     def __init__(
         self,
@@ -39,9 +39,9 @@ class MLPWithAdapterModel(MLPModel):
         activation: str = "elu",
         obs_normalization: bool = False,
         distribution_cfg: dict | None = None,
-        adapter_obs_group: str = "adapter",
-        rank: int | list[int | None] = -1,
-        alpha: float = 1.0,
+        sidecar_obs_group: str = "sidecar",
+        sidecar_hidden_dims: tuple[int, ...] | list[int] = (256,),
+        sidecar_activation: str = "elu",
         wbc_checkpoint: str | None = None,
         freeze_base: bool = True,
     ) -> None:
@@ -67,18 +67,24 @@ class MLPWithAdapterModel(MLPModel):
             if unexpected:
                 raise RuntimeError(f"wbc_checkpoint has unexpected keys: {unexpected}")
 
-        # Adapter stream: separate obs group + its own (trainable) normalizer.
-        self.adapter_obs_groups = [adapter_obs_group]
-        adapter_dim = self._concat_dim(obs, self.adapter_obs_groups)
-        self.adapter_normalizer = EmpiricalNormalization(adapter_dim) if obs_normalization else torch.nn.Identity()
+        # Sidecar stream: separate obs group + its own (trainable) normalizer.
+        self.sidecar_obs_groups = [sidecar_obs_group]
+        sidecar_dim = self._concat_dim(obs, self.sidecar_obs_groups)
+        self.sidecar_normalizer = (
+            EmpiricalNormalization(sidecar_dim) if obs_normalization else torch.nn.Identity()
+        )
 
-        # Strap adapter on the (now loaded) base.
-        self.mlp = self._adapter_cls.from_base_mlp(
-            self.mlp, adapter_input_dim=adapter_dim, rank=rank, alpha=alpha, freeze_base=freeze_base
+        # Strap sidecar on the (now loaded) base.
+        self.mlp = self._sidecar_cls.from_base_mlp(
+            self.mlp,
+            sidecar_input_dim=sidecar_dim,
+            sidecar_hidden_dims=sidecar_hidden_dims,
+            sidecar_activation=sidecar_activation,
+            freeze_base=freeze_base,
         )
 
         # Remove modular-norm hooks if present: the off-manifold base (frozen or fine-tuned with free-Adam)
-        # must never be dualized/projected, and adapters need neither hook.
+        # must never be dualized/projected, and the sidecar needs neither hook.
         for hook in ("dualize_gradients", "project_weights"):
             if hasattr(self, hook):
                 delattr(self, hook)
@@ -91,9 +97,9 @@ class MLPWithAdapterModel(MLPModel):
     def _concat_dim(obs: TensorDict, groups: list[str]) -> int:
         return sum(obs[group].shape[-1] for group in groups)
 
-    def _get_adapter_latent(self, obs: TensorDict) -> torch.Tensor:
-        latent = torch.cat([obs[group] for group in self.adapter_obs_groups], dim=-1)
-        return self.adapter_normalizer(latent)
+    def _get_sidecar_latent(self, obs: TensorDict) -> torch.Tensor:
+        latent = torch.cat([obs[group] for group in self.sidecar_obs_groups], dim=-1)
+        return self.sidecar_normalizer(latent)
 
     def _print_param_summary(self, freeze_base: bool) -> None:
         """Pretty-print per-component trainable / total param counts."""
@@ -104,31 +110,26 @@ class MLPWithAdapterModel(MLPModel):
 
         sep = "─" * 62
         print(f"\n{sep}")
-        print(f"  MLPWithAdapterModel  (base {'frozen' if freeze_base else 'unfrozen'})")
+        print(f"  MLPWithSidecarModel  (base {'frozen' if freeze_base else 'unfrozen'})")
         print(sep)
         print(f"  {'component':<28} {'trainable':>12} {'total':>12}")
         print(f"  {'─'*28} {'─'*12} {'─'*12}")
 
         grand_train, grand_total = 0, 0
 
-        # base layers
-        for i, linear in enumerate(self.mlp.base_linears):
-            tr, tot = _count(linear)
-            tag = "frozen" if not tr else ""
-            print(f"  base linear[{i}] {tag:<12} {tr:>12,} {tot:>12,}")
-            grand_train += tr; grand_total += tot
+        # base
+        tr, tot = _count(self.mlp.base)
+        tag = "frozen" if not tr else ""
+        print(f"  base {tag:<22} {tr:>12,} {tot:>12,}")
+        grand_train += tr; grand_total += tot
 
-        # adapters
-        for i, adapter in enumerate(self.mlp.adapters):
-            if adapter is not None:
-                tr, tot = _count(adapter)
-                print(f"  adapter[{i}]{'':16} {tr:>12,} {tot:>12,}")
-                grand_train += tr; grand_total += tot
-            else:
-                print(f"  adapter[{i}]{'':16} {'—':>12} {'—':>12}")
+        # sidecar
+        tr, tot = _count(self.mlp.sidecar)
+        print(f"  sidecar{'':19} {tr:>12,} {tot:>12,}")
+        grand_train += tr; grand_total += tot
 
         # normalizers
-        for name, mod in [("base normalizer", self.obs_normalizer), ("adapter normalizer", self.adapter_normalizer)]:
+        for name, mod in [("base normalizer", self.obs_normalizer), ("sidecar normalizer", self.sidecar_normalizer)]:
             tr, tot = _count(mod)
             if tot:
                 print(f"  {name:<28} {tr:>12,} {tot:>12,}")
@@ -157,8 +158,8 @@ class MLPWithAdapterModel(MLPModel):
         stochastic_output: bool = False,
     ) -> torch.Tensor:
         base_latent = self.get_latent(obs, masks, hidden_state)
-        adapter_latent = self._get_adapter_latent(obs)
-        mlp_output = self.mlp(base_latent, adapter_latent)
+        sidecar_latent = self._get_sidecar_latent(obs)
+        mlp_output = self.mlp(base_latent, sidecar_latent)
         if self.distribution is not None:
             if stochastic_output:
                 self.distribution.update(mlp_output)
@@ -167,34 +168,29 @@ class MLPWithAdapterModel(MLPModel):
         return mlp_output
 
     def update_normalization(self, obs: TensorDict) -> None:
-        """Update only the adapter normalizer; base normalizer stays frozen."""
+        """Update only the sidecar normalizer; base normalizer stays frozen."""
         if self.obs_normalization:
-            latent = torch.cat([obs[group] for group in self.adapter_obs_groups], dim=-1)
-            self.adapter_normalizer.update(latent)  # type: ignore
+            latent = torch.cat([obs[group] for group in self.sidecar_obs_groups], dim=-1)
+            self.sidecar_normalizer.update(latent)  # type: ignore
 
-    def adapter_diagnostics(self) -> dict[str, float]:
-        """Per-layer adapter weight norms under ``AdapterStats/``."""
-        diag: dict[str, float] = {}
-        for i, adapter in enumerate(self.mlp.adapters):
-            if adapter is not None:
-                diag[f"AdapterStats/layer_{i}_delta_w_norm"] = adapter.delta_weight().norm().item()
-        return diag
+    def sidecar_diagnostics(self) -> dict[str, float]:
+        """Sidecar head weight norm under ``SidecarStats/``."""
+        return {"SidecarStats/head_weight_norm": self.mlp.sidecar.head.weight.norm().item()}
 
     def as_jit(self) -> torch.nn.Module:
-        raise NotImplementedError("JIT export for MLPWithAdapterModel is not implemented yet.")
+        raise NotImplementedError("JIT export for MLPWithSidecarModel is not implemented yet.")
 
     def as_onnx(self, verbose: bool) -> torch.nn.Module:
-        raise NotImplementedError("ONNX export for MLPWithAdapterModel is not implemented yet.")
+        raise NotImplementedError("ONNX export for MLPWithSidecarModel is not implemented yet.")
 
 
-class ModularNormMLPWithAdapterModel(MLPWithAdapterModel):
-    """An :class:`MLPWithAdapterModel` whose frozen base is a :class:`~rsl_rl.modules.ModularNormMLP`.
+class ModularNormMLPWithSidecarModel(MLPWithSidecarModel):
+    """An :class:`MLPWithSidecarModel` whose frozen base is a :class:`~rsl_rl.modules.ModularNormMLP`.
 
-    Used to adapt the bias-free, modular-norm TextOp WBC. The adapters themselves are plain
-    free-Adam :class:`~rsl_rl.modules.Adapter` modules (no spectral constraint).
+    Used to adapt the bias-free, modular-norm TextOp WBC with a free-Adam sidecar.
     """
 
-    _adapter_cls = ModularNormMLPWithAdapter
+    _sidecar_cls = ModularNormMLPWithSidecar
 
     def _make_mlp(self, input_dim, output_dim, hidden_dims, activation):
         from rsl_rl.modules import ModularNormMLP
