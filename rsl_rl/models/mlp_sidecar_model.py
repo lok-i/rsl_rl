@@ -23,6 +23,11 @@ class MLPWithSidecarModel(MLPModel):
     - **base stream** — ``obs_groups[obs_set]``, normalized by the (frozen) base normalizer.
     - **sidecar stream** — ``sidecar_obs_group`` (e.g. object state), with its own trainable normalizer.
 
+    True to RPL (Tom Silver et al. 2018), the sidecar sees the **full state**: both the base-normalized
+    policy obs and the sidecar-normalized augmentation obs are concatenated as its input. This gives the
+    residual network access to robot proprioception (via the base stream) — without it, the sidecar can
+    only produce state-blind corrections.
+
     Subclass :class:`ModularNormMLPWithSidecarModel` when the frozen base is a ``ModularNormMLP``.
     """
 
@@ -69,15 +74,19 @@ class MLPWithSidecarModel(MLPModel):
 
         # Sidecar stream: separate obs group + its own (trainable) normalizer.
         self.sidecar_obs_groups = [sidecar_obs_group]
-        sidecar_dim = self._concat_dim(obs, self.sidecar_obs_groups)
+        sidecar_aug_dim = self._concat_dim(obs, self.sidecar_obs_groups)
         self.sidecar_normalizer = (
-            EmpiricalNormalization(sidecar_dim) if obs_normalization else torch.nn.Identity()
+            EmpiricalNormalization(sidecar_aug_dim) if obs_normalization else torch.nn.Identity()
         )
+
+        # RPL: sidecar sees full state = base obs (policy) + augmentation obs (object).
+        # Each stream is independently normalized before concat.
+        sidecar_input_dim = self.obs_dim + sidecar_aug_dim
 
         # Strap sidecar on the (now loaded) base.
         self.mlp = self._sidecar_cls.from_base_mlp(
             self.mlp,
-            sidecar_input_dim=sidecar_dim,
+            sidecar_input_dim=sidecar_input_dim,
             sidecar_hidden_dims=sidecar_hidden_dims,
             sidecar_activation=sidecar_activation,
             freeze_base=freeze_base,
@@ -159,7 +168,8 @@ class MLPWithSidecarModel(MLPModel):
     ) -> torch.Tensor:
         base_latent = self.get_latent(obs, masks, hidden_state)
         sidecar_latent = self._get_sidecar_latent(obs)
-        mlp_output = self.mlp(base_latent, sidecar_latent)
+        sidecar_input = torch.cat([base_latent, sidecar_latent], dim=-1)
+        mlp_output = self.mlp(base_latent, sidecar_input)
         if self.distribution is not None:
             if stochastic_output:
                 self.distribution.update(mlp_output)
