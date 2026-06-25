@@ -48,6 +48,7 @@ class MLPWithSidecarModel(MLPModel):
         sidecar_hidden_dims: tuple[int, ...] | list[int] = (256,),
         sidecar_activation: str = "elu",
         sidecar_head_init_gain: float = 0.01,
+        sidecar_output_bound: float | None = None,
         condition_on_base_output: bool = False,
         base_checkpoint: str | None = None,
         freeze_base: bool = True,
@@ -92,6 +93,7 @@ class MLPWithSidecarModel(MLPModel):
             sidecar_hidden_dims=sidecar_hidden_dims,
             sidecar_activation=sidecar_activation,
             sidecar_head_init_gain=sidecar_head_init_gain,
+            sidecar_output_bound=sidecar_output_bound,
             condition_on_base_output=condition_on_base_output,
             freeze_base=freeze_base,
         )
