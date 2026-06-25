@@ -206,9 +206,7 @@ class MLPWithAdapter(nn.Module):
 class ModularNormMLPWithAdapter(MLPWithAdapter):
     """An :class:`MLPWithAdapter` whose frozen base is a :class:`~rsl_rl.modules.ModularNormMLP`.
 
-    This is the variant used to adapt the (bias-free, modular-norm) TextOp WBC: load the pretrained
-    weights into the base, freeze it, and train only the strapped free-Adam adapters. The adapters
-    themselves are plain :class:`Adapter` modules (no modular-norm constraint).
+    The adapters themselves are plain :class:`Adapter` modules (no modular-norm constraint).
     """
 
     base_mlp_class: type[MLP] = ModularNormMLP

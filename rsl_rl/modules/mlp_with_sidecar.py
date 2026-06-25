@@ -169,9 +169,6 @@ class MLPWithSidecar(nn.Module):
 
 
 class ModularNormMLPWithSidecar(MLPWithSidecar):
-    """An :class:`MLPWithSidecar` whose frozen base is a :class:`~rsl_rl.modules.ModularNormMLP`.
-
-    Used to adapt the bias-free, modular-norm TextOp WBC with a free-Adam sidecar.
-    """
+    """An :class:`MLPWithSidecar` whose frozen base is a :class:`~rsl_rl.modules.ModularNormMLP`."""
 
     base_mlp_class: type[MLP] = ModularNormMLP

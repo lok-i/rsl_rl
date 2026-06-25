@@ -42,7 +42,7 @@ class MLPWithAdapterModel(MLPModel):
         adapter_obs_group: str = "augmentation",
         rank: int | list[int | None] = -1,
         alpha: float = 1.0,
-        wbc_checkpoint: str | None = None,
+        base_checkpoint: str | None = None,
         freeze_base: bool = True,
     ) -> None:
         super().__init__(
@@ -57,15 +57,15 @@ class MLPWithAdapterModel(MLPModel):
         )
 
         # Load pretrained base BEFORE strapping (self.mlp is still a plain MLP whose keys match).
-        if wbc_checkpoint is not None:
+        if base_checkpoint is not None:
             if not obs_normalization:
-                raise ValueError("wbc_checkpoint requires obs_normalization=True to load the base normalizer.")
-            payload = torch.load(wbc_checkpoint, map_location="cpu", weights_only=False)
+                raise ValueError("base_checkpoint requires obs_normalization=True to load the base normalizer.")
+            payload = torch.load(base_checkpoint, map_location="cpu", weights_only=False)
             is_ported = isinstance(payload, dict) and "model_state_dict" in payload
             state_dict = payload["model_state_dict"] if is_ported else payload
             _, unexpected = self.load_state_dict(state_dict, strict=False)
             if unexpected:
-                raise RuntimeError(f"wbc_checkpoint has unexpected keys: {unexpected}")
+                raise RuntimeError(f"base_checkpoint has unexpected keys: {unexpected}")
 
         # Adapter stream: separate obs group + its own (trainable) normalizer.
         self.adapter_obs_groups = [adapter_obs_group]
@@ -77,8 +77,7 @@ class MLPWithAdapterModel(MLPModel):
             self.mlp, adapter_input_dim=adapter_dim, rank=rank, alpha=alpha, freeze_base=freeze_base
         )
 
-        # Remove modular-norm hooks if present: the off-manifold base (frozen or fine-tuned with free-Adam)
-        # must never be dualized/projected, and adapters need neither hook.
+        # Remove modular-norm hooks if present: the adapted base must never be dualized/projected.
         for hook in ("dualize_gradients", "project_weights"):
             if hasattr(self, hook):
                 delattr(self, hook)
@@ -188,11 +187,7 @@ class MLPWithAdapterModel(MLPModel):
 
 
 class ModularNormMLPWithAdapterModel(MLPWithAdapterModel):
-    """An :class:`MLPWithAdapterModel` whose frozen base is a :class:`~rsl_rl.modules.ModularNormMLP`.
-
-    Used to adapt the bias-free, modular-norm TextOp WBC. The adapters themselves are plain
-    free-Adam :class:`~rsl_rl.modules.Adapter` modules (no spectral constraint).
-    """
+    """An :class:`MLPWithAdapterModel` whose frozen base is a :class:`~rsl_rl.modules.ModularNormMLP`."""
 
     _adapter_cls = ModularNormMLPWithAdapter
 

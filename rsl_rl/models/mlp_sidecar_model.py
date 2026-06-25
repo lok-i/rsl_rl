@@ -47,7 +47,7 @@ class MLPWithSidecarModel(MLPModel):
         sidecar_obs_group: str = "augmentation",
         sidecar_hidden_dims: tuple[int, ...] | list[int] = (256,),
         sidecar_activation: str = "elu",
-        wbc_checkpoint: str | None = None,
+        base_checkpoint: str | None = None,
         freeze_base: bool = True,
     ) -> None:
         super().__init__(
@@ -62,15 +62,15 @@ class MLPWithSidecarModel(MLPModel):
         )
 
         # Load pretrained base BEFORE strapping (self.mlp is still a plain MLP whose keys match).
-        if wbc_checkpoint is not None:
+        if base_checkpoint is not None:
             if not obs_normalization:
-                raise ValueError("wbc_checkpoint requires obs_normalization=True to load the base normalizer.")
-            payload = torch.load(wbc_checkpoint, map_location="cpu", weights_only=False)
+                raise ValueError("base_checkpoint requires obs_normalization=True to load the base normalizer.")
+            payload = torch.load(base_checkpoint, map_location="cpu", weights_only=False)
             is_ported = isinstance(payload, dict) and "model_state_dict" in payload
             state_dict = payload["model_state_dict"] if is_ported else payload
             _, unexpected = self.load_state_dict(state_dict, strict=False)
             if unexpected:
-                raise RuntimeError(f"wbc_checkpoint has unexpected keys: {unexpected}")
+                raise RuntimeError(f"base_checkpoint has unexpected keys: {unexpected}")
 
         # Sidecar stream: separate obs group + its own (trainable) normalizer.
         self.sidecar_obs_groups = [sidecar_obs_group]
@@ -92,8 +92,7 @@ class MLPWithSidecarModel(MLPModel):
             freeze_base=freeze_base,
         )
 
-        # Remove modular-norm hooks if present: the off-manifold base (frozen or fine-tuned with free-Adam)
-        # must never be dualized/projected, and the sidecar needs neither hook.
+        # Remove modular-norm hooks if present: the adapted base must never be dualized/projected.
         for hook in ("dualize_gradients", "project_weights"):
             if hasattr(self, hook):
                 delattr(self, hook)
@@ -195,10 +194,7 @@ class MLPWithSidecarModel(MLPModel):
 
 
 class ModularNormMLPWithSidecarModel(MLPWithSidecarModel):
-    """An :class:`MLPWithSidecarModel` whose frozen base is a :class:`~rsl_rl.modules.ModularNormMLP`.
-
-    Used to adapt the bias-free, modular-norm TextOp WBC with a free-Adam sidecar.
-    """
+    """An :class:`MLPWithSidecarModel` whose frozen base is a :class:`~rsl_rl.modules.ModularNormMLP`."""
 
     _sidecar_cls = ModularNormMLPWithSidecar
 
