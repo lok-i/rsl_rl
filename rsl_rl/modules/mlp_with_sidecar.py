@@ -17,14 +17,23 @@ from .modular_norm_mlp import ModularNormMLP
 
 
 class Sidecar(nn.Module):
-    """A bounded side network whose output is added to a base network's output.
+    """A side network whose output is added to a base network's output.
 
-    The trunk (hidden layers) uses PyTorch default initialization; the output head is Xavier-
-    initialized with a small gain (default 0.01).  When ``output_bound`` is set (default 1.0),
-    the raw output is ``tanh``-squashed and scaled so the residual is in ``[-output_bound,
-    output_bound]``.  This prevents the sidecar from producing unbounded action deltas that
-    destabilize PPO's adaptive learning-rate schedule.  Set ``output_bound = None`` to disable
-    squashing (linear head, original behaviour).
+    The trunk uses PyTorch default initialization; the output head is Xavier-initialized with
+    a small gain (default 0.01).  Two orthogonal output-shaping knobs control the residual:
+
+    - ``output_bound`` — applied first. When ``"tanh"``, squashes the raw head output to
+      ``[-1, 1]``.  ``None`` = no squashing (identity).
+    - ``output_scale`` — applied second, always. Linear multiplier on the (optionally
+      bounded) output.
+
+    Method of composition (MOR)::
+
+        output = output_scale * bound(head(trunk(x)))
+
+    With ``output_bound="tanh"``, the final range is ``[-output_scale, output_scale]``.
+    With ``output_bound=None``, the output is ``output_scale * head(trunk(x))`` (unbounded).
+    See ``sidecar_design_rationale.md`` for why RPL benefits from bounded outputs.
 
     Args:
         input_dim: Sidecar input width (may differ from the base input).
@@ -32,7 +41,8 @@ class Sidecar(nn.Module):
         hidden_dims: Sidecar-private hidden layer widths. Empty → linear projection.
         activation: Activation between hidden layers.
         head_init_gain: Xavier-uniform gain for the output head (default 0.01).
-        output_bound: If not ``None``, squash output to ``[-output_bound, output_bound]`` via tanh.
+        output_scale: Linear multiplier on the sidecar output (default 1.0).
+        output_bound: Squashing function applied before scaling. ``"tanh"`` or ``None``.
     """
 
     def __init__(
@@ -42,9 +52,17 @@ class Sidecar(nn.Module):
         hidden_dims: tuple[int, ...] | list[int] = (256,),
         activation: str = "elu",
         head_init_gain: float = 0.01,
-        output_bound: float | None = None,
+        output_scale: float = 1.0,
+        output_bound: str | None = None,
     ) -> None:
         super().__init__()
+        # Legacy compat: float output_bound (e.g. 1.0) → absorb into scale, set bound="tanh".
+        if isinstance(output_bound, (int, float)):
+            output_scale = output_scale * float(output_bound)
+            output_bound = "tanh"
+        if output_bound is not None and output_bound != "tanh":
+            raise ValueError(f"output_bound must be 'tanh', None, or a float (legacy), got {output_bound!r}")
+        self.output_scale = output_scale
         self.output_bound = output_bound
         act = resolve_nn_activation(activation)
 
@@ -65,11 +83,11 @@ class Sidecar(nn.Module):
         nn.init.xavier_uniform_(self.head.weight, gain=head_init_gain)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return the bounded residual action."""
+        """Return the (optionally bounded and scaled) residual action."""
         raw = self.head(self.trunk(x))
-        if self.output_bound is not None:
-            return self.output_bound * torch.tanh(raw)
-        return raw
+        if self.output_bound == "tanh":
+            raw = torch.tanh(raw)
+        return self.output_scale * raw
 
 
 class MLPWithSidecar(nn.Module):
@@ -98,7 +116,8 @@ class MLPWithSidecar(nn.Module):
         sidecar_hidden_dims: Hidden layer widths of the sidecar network.
         sidecar_activation: Activation function of the sidecar trunk.
         sidecar_head_init_gain: Xavier-uniform gain for the sidecar output head (default 0.01).
-        sidecar_output_bound: Tanh-squash the sidecar output to ``[-bound, bound]``. ``None`` = unbounded.
+        sidecar_output_scale: Linear multiplier on the sidecar output (default 1.0).
+        sidecar_output_bound: Squashing function before scaling. ``"tanh"`` or ``None``.
         condition_on_base_output: If ``True``, the base output is concatenated to the sidecar input.
         freeze_base: If ``True`` (default), the base weights are frozen.
     """
@@ -117,7 +136,8 @@ class MLPWithSidecar(nn.Module):
         sidecar_hidden_dims: tuple[int, ...] | list[int] = (256,),
         sidecar_activation: str = "elu",
         sidecar_head_init_gain: float = 0.01,
-        sidecar_output_bound: float | None = None,
+        sidecar_output_scale: float = 1.0,
+        sidecar_output_bound: str | None = None,
         condition_on_base_output: bool = False,
         freeze_base: bool = True,
     ) -> None:
@@ -130,6 +150,7 @@ class MLPWithSidecar(nn.Module):
             sidecar_hidden_dims,
             sidecar_activation,
             sidecar_head_init_gain,
+            sidecar_output_scale,
             sidecar_output_bound,
         )
 
@@ -141,7 +162,8 @@ class MLPWithSidecar(nn.Module):
         sidecar_hidden_dims: tuple[int, ...] | list[int] = (256,),
         sidecar_activation: str = "elu",
         sidecar_head_init_gain: float = 0.01,
-        sidecar_output_bound: float | None = None,
+        sidecar_output_scale: float = 1.0,
+        sidecar_output_bound: str | None = None,
         condition_on_base_output: bool = False,
         freeze_base: bool = True,
     ) -> MLPWithSidecar:
@@ -160,6 +182,7 @@ class MLPWithSidecar(nn.Module):
             sidecar_hidden_dims,
             sidecar_activation,
             sidecar_head_init_gain,
+            sidecar_output_scale,
             sidecar_output_bound,
         )
         return obj
@@ -181,15 +204,17 @@ class MLPWithSidecar(nn.Module):
         sidecar_hidden_dims: tuple[int, ...] | list[int],
         sidecar_activation: str,
         head_init_gain: float = 0.01,
-        output_bound: float | None = None,
+        output_scale: float = 1.0,
+        output_bound: str | None = None,
     ) -> None:
-        """Build the bounded sidecar network matching the base output width."""
+        """Build the sidecar network matching the base output width."""
         base_last: nn.Linear = self.base[-1]  # type: ignore[assignment]
         output_dim: int = base_last.out_features
         if self.condition_on_base_output:
             sidecar_input_dim += output_dim
         self.sidecar = Sidecar(
-            sidecar_input_dim, output_dim, sidecar_hidden_dims, sidecar_activation, head_init_gain, output_bound,
+            sidecar_input_dim, output_dim, sidecar_hidden_dims, sidecar_activation,
+            head_init_gain, output_scale, output_bound,
         )
 
     def forward(self, obs: torch.Tensor, sidecar_obs: torch.Tensor | None = None) -> torch.Tensor:
