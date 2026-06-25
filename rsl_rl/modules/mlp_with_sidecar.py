@@ -17,17 +17,20 @@ from .modular_norm_mlp import ModularNormMLP
 
 
 class Sidecar(nn.Module):
-    """A zero-initialized side network whose output is added to a base network's output.
+    """A near-zero-initialized side network whose output is added to a base network's output.
 
-    The trunk (hidden layers) uses standard initialization; the output head is zero-initialized,
-    so ``forward(x) == 0`` at construction and the composed ``base + sidecar`` reproduces the
-    base exactly.
+    The trunk (hidden layers) uses PyTorch default initialization; the output head is Xavier-
+    initialized with a small gain (default 0.01), so ``forward(x) ≈ 0`` at construction and the
+    composed ``base + sidecar`` reproduces the base to first order.  Unlike exact zero-init, the
+    head is non-zero from step 0, which keeps the adaptive-LR KL estimate honest and avoids a
+    learning-rate runaway that otherwise precedes the first non-trivial sidecar contribution.
 
     Args:
         input_dim: Sidecar input width (may differ from the base input).
         output_dim: Must match the base output width.
-        hidden_dims: Sidecar-private hidden layer widths. Empty → linear zero-init projection.
+        hidden_dims: Sidecar-private hidden layer widths. Empty → linear projection.
         activation: Activation between hidden layers.
+        head_init_gain: Xavier-uniform gain for the output head (default 0.01).
     """
 
     def __init__(
@@ -36,7 +39,7 @@ class Sidecar(nn.Module):
         output_dim: int,
         hidden_dims: tuple[int, ...] | list[int] = (256,),
         activation: str = "elu",
-        init_gain: float | None = None,
+        head_init_gain: float = 0.01,
     ) -> None:
         super().__init__()
         act = resolve_nn_activation(activation)
@@ -55,18 +58,7 @@ class Sidecar(nn.Module):
             head_in = input_dim
 
         self.head = nn.Linear(head_in, output_dim, bias=False)
-        nn.init.zeros_(self.head.weight)
-
-        if init_gain is not None:
-            self._init_trunk_xavier(init_gain)
-
-    def _init_trunk_xavier(self, gain: float) -> None:
-        """Re-initialize trunk linear layers with Xavier uniform scaled by ``gain``."""
-        for module in self.trunk.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=gain)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+        nn.init.xavier_uniform_(self.head.weight, gain=head_init_gain)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Return the (zero-at-init) residual action."""
@@ -78,8 +70,8 @@ class MLPWithSidecar(nn.Module):
 
     ``a = base(obs) + sidecar(sidecar_obs [, base(obs)])``
 
-    The sidecar is a separate MLP with its own architecture and a zero-initialized output head,
-    so the composed network starts from the base behaviour exactly. The first (sidecar) input may
+    The sidecar is a separate MLP with its own architecture and a near-zero-initialized output head,
+    so the composed network starts approximately from the base behaviour. The first (sidecar) input may
     differ in width from the base input — e.g. an augmentation observation group that the base
     policy was never trained on.
 
@@ -98,7 +90,7 @@ class MLPWithSidecar(nn.Module):
         sidecar_input_dim: Input dimension of the sidecar. ``None`` reuses ``input_dim``.
         sidecar_hidden_dims: Hidden layer widths of the sidecar network.
         sidecar_activation: Activation function of the sidecar trunk.
-        sidecar_init_gain: If set, re-initialize the sidecar trunk with Xavier uniform scaled by this gain.
+        sidecar_head_init_gain: Xavier-uniform gain for the sidecar output head (default 0.01).
         condition_on_base_output: If ``True``, the base output is concatenated to the sidecar input.
         freeze_base: If ``True`` (default), the base weights are frozen.
     """
@@ -116,7 +108,7 @@ class MLPWithSidecar(nn.Module):
         sidecar_input_dim: int | None = None,
         sidecar_hidden_dims: tuple[int, ...] | list[int] = (256,),
         sidecar_activation: str = "elu",
-        sidecar_init_gain: float | None = None,
+        sidecar_head_init_gain: float = 0.01,
         condition_on_base_output: bool = False,
         freeze_base: bool = True,
     ) -> None:
@@ -128,7 +120,7 @@ class MLPWithSidecar(nn.Module):
             sidecar_input_dim if sidecar_input_dim is not None else input_dim,
             sidecar_hidden_dims,
             sidecar_activation,
-            sidecar_init_gain,
+            sidecar_head_init_gain,
         )
 
     @classmethod
@@ -138,7 +130,7 @@ class MLPWithSidecar(nn.Module):
         sidecar_input_dim: int | None = None,
         sidecar_hidden_dims: tuple[int, ...] | list[int] = (256,),
         sidecar_activation: str = "elu",
-        sidecar_init_gain: float | None = None,
+        sidecar_head_init_gain: float = 0.01,
         condition_on_base_output: bool = False,
         freeze_base: bool = True,
     ) -> MLPWithSidecar:
@@ -156,7 +148,7 @@ class MLPWithSidecar(nn.Module):
             sidecar_input_dim if sidecar_input_dim is not None else base_input_dim,
             sidecar_hidden_dims,
             sidecar_activation,
-            sidecar_init_gain,
+            sidecar_head_init_gain,
         )
         return obj
 
@@ -176,14 +168,14 @@ class MLPWithSidecar(nn.Module):
         sidecar_input_dim: int,
         sidecar_hidden_dims: tuple[int, ...] | list[int],
         sidecar_activation: str,
-        init_gain: float | None = None,
+        head_init_gain: float = 0.01,
     ) -> None:
-        """Build the zero-initialized sidecar network matching the base output width."""
+        """Build the near-zero-initialized sidecar network matching the base output width."""
         base_last: nn.Linear = self.base[-1]  # type: ignore[assignment]
         output_dim: int = base_last.out_features
         if self.condition_on_base_output:
             sidecar_input_dim += output_dim
-        self.sidecar = Sidecar(sidecar_input_dim, output_dim, sidecar_hidden_dims, sidecar_activation, init_gain)
+        self.sidecar = Sidecar(sidecar_input_dim, output_dim, sidecar_hidden_dims, sidecar_activation, head_init_gain)
 
     def forward(self, obs: torch.Tensor, sidecar_obs: torch.Tensor | None = None) -> torch.Tensor:
         """Forward: ``base(obs) + sidecar(sidecar_obs [, base(obs)])``.
