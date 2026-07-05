@@ -7,6 +7,7 @@
 
 from .cnn import CNN
 from .distribution import BetaDistribution, Distribution, GaussianDistribution, HeteroscedasticGaussianDistribution
+from .feature_encoder import FeatureEncoder
 from .mlp import MLP
 from .mlp_with_adapter import Adapter, MLPWithAdapter, ModularNormMLPWithAdapter
 from .mlp_with_sidecar import Sidecar, MLPWithSidecar, ModularNormMLPWithSidecar
@@ -23,6 +24,7 @@ __all__ = [
     "Distribution",
     "EmpiricalDiscountedVariationNormalization",
     "EmpiricalNormalization",
+    "FeatureEncoder",
     "GaussianDistribution",
     "HeteroscedasticGaussianDistribution",
     "HiddenState",
