@@ -11,6 +11,7 @@ from .mlp_adapter_model import MLPWithAdapterModel, ModularNormMLPWithAdapterMod
 from .mlp_sidecar_model import MLPWithSidecarModel, ModularNormMLPWithSidecarModel
 from .mlp_model import MLPModel, ModularNormMLPModel
 from .rnn_model import RNNModel
+from .sonic_base_model import SonicBaseModel
 
 __all__ = [
     "CNNModel",
@@ -23,4 +24,5 @@ __all__ = [
     "ModularNormMLPWithAdapterModel",
     "ModularNormMLPWithSidecarModel",
     "RNNModel",
+    "SonicBaseModel",
 ]
