@@ -20,6 +20,7 @@ from rsl_rl.modules import EmpiricalNormalization, FeatureEncoder, HiddenState
 
 from .mlp_adapter_model import ModularNormMLPWithAdapterModel
 from .mlp_model import MLPModel
+from .sonic_adapter_model import SonicWithAdapterModel
 
 
 def _build_encoders(obs: TensorDict, encoder_cfg: dict[str, dict] | None, encoders: dict | None) -> dict:
@@ -127,12 +128,13 @@ class FeatureEncoderMLPModel(MLPModel):
         raise NotImplementedError("ONNX export for FeatureEncoderMLPModel is not implemented yet.")
 
 
-class FeatureEncoderAdapterModel(ModularNormMLPWithAdapterModel):
-    """A :class:`ModularNormMLPWithAdapterModel` whose adapter stream is feature-encoded.
+class EncodedAdapterStreamMixin:
+    """Feature-encoded adapter stream for frozen-base + LoRA models.
 
     The frozen base stream is untouched. The adapter stream may mix encoded groups (through
     their FeatureEncoders) and plain groups (through a trainable stream normalizer);
-    ``adapter_obs_group`` accepts a single group name or a list.
+    ``adapter_obs_group`` accepts a single group name or a list. Exposes ``encoders`` and
+    ``encode()`` — the contract PPOAux objectives bind to.
     """
 
     def __init__(
@@ -146,10 +148,10 @@ class FeatureEncoderAdapterModel(ModularNormMLPWithAdapterModel):
         encoders: dict | None = None,
         **kwargs: Any,
     ) -> None:
-        """Initialize the adapter model with a feature-encoded adapter stream."""
+        """Initialize the host adapter model with a feature-encoded adapter stream."""
         self._encoders = _build_encoders(obs, encoder_cfg, encoders)
         stream_groups = [adapter_obs_group] if isinstance(adapter_obs_group, str) else list(adapter_obs_group)
-        # The parent wraps adapter_obs_group in a list; our _concat_dim override flattens it and
+        # The host wraps adapter_obs_group in a list; our _concat_dim override flattens it and
         # reports encoder latent dims so the LoRA adapter is strapped with the effective input dim.
         super().__init__(
             obs=obs,
@@ -168,10 +170,10 @@ class FeatureEncoderAdapterModel(ModularNormMLPWithAdapterModel):
         if not self.encoded_adapter_groups:
             raise ValueError(f"No adapter-stream group in {stream_groups} has an encoder.")
         self.plain_adapter_groups = [g for g in stream_groups if g not in self._encoders]
-        # Replace the parent's stream normalizer (sized for the full effective dim) with one
+        # Replace the host's stream normalizer (sized for the full effective dim) with one
         # covering only the plain groups; encoded groups normalize inside their encoders.
         plain_dim = sum(obs[g].shape[-1] for g in self.plain_adapter_groups)
-        if self.obs_normalization and plain_dim > 0:
+        if plain_dim > 0:
             self.adapter_normalizer = EmpiricalNormalization(plain_dim)
         else:
             self.adapter_normalizer = nn.Identity()
@@ -193,9 +195,9 @@ class FeatureEncoderAdapterModel(ModularNormMLPWithAdapterModel):
 
     def update_normalization(self, obs: TensorDict) -> None:
         """Update the plain-stream normalizer and encoder normalizers; base stays frozen."""
-        if self.obs_normalization and self.plain_adapter_groups:
+        if self.plain_adapter_groups and isinstance(self.adapter_normalizer, EmpiricalNormalization):
             plain = torch.cat([obs[g] for g in self.plain_adapter_groups], dim=-1)
-            self.adapter_normalizer.update(plain)  # type: ignore
+            self.adapter_normalizer.update(plain)
         for g in self.encoded_adapter_groups:
             self.encoders[g].update_normalization(obs[g])
 
@@ -204,3 +206,11 @@ class FeatureEncoderAdapterModel(ModularNormMLPWithAdapterModel):
     def encode(self, obs: TensorDict) -> torch.Tensor:
         """Concatenated encoder latents (the representation shared with auxiliary objectives)."""
         return torch.cat([self.encoders[g](obs[g]) for g in self.encoded_adapter_groups], dim=-1)
+
+
+class FeatureEncoderAdapterModel(EncodedAdapterStreamMixin, ModularNormMLPWithAdapterModel):
+    """A :class:`ModularNormMLPWithAdapterModel` whose adapter stream is feature-encoded."""
+
+
+class FeatureEncoderSonicAdapterModel(EncodedAdapterStreamMixin, SonicWithAdapterModel):
+    """A :class:`SonicWithAdapterModel` whose adapter stream is feature-encoded."""

@@ -176,7 +176,14 @@ class SonicBaseModel(nn.Module):
         """Deterministic action mean (or distribution output) for the given obs."""
         obs = unpad_trajectories(obs, masks) if masks is not None else obs
         tokens = self.encode_tokens(obs, latent_residual)
-        mlp_output = self.decoder(torch.cat([tokens, self._get_proprio(obs)], dim=-1))
+        return self._head(self._decode(tokens, obs), stochastic_output)
+
+    def _decode(self, tokens: torch.Tensor, obs: TensorDict) -> torch.Tensor:
+        """Run the decoder over [tokens | proprio]. Adapter variants override this."""
+        return self.decoder(torch.cat([tokens, self._get_proprio(obs)], dim=-1))
+
+    def _head(self, mlp_output: torch.Tensor, stochastic_output: bool) -> torch.Tensor:
+        """Distribution head (identity when the model is deterministic)."""
         if self.distribution is not None:
             if stochastic_output:
                 self.distribution.update(mlp_output)
