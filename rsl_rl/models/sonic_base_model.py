@@ -139,6 +139,19 @@ class SonicBaseModel(nn.Module):
                 raise RuntimeError(
                     f"base_checkpoint mismatch: missing={missing}, unexpected={unexpected}"
                 )
+            # Seed the action std from the ported ckpt's meta — the GEAR ckpt
+            # keeps action_std outside the module tree, so load_state_dict
+            # can't restore it. Starting at the base's converged per-dim std
+            # keeps adapter exploration inside the frozen WBC's competent band
+            # (same behavior textop gets for free via distribution.std_param).
+            action_std = payload.get("meta", {}).get("action_std")
+            if action_std is not None and self.distribution is not None:
+                std = torch.as_tensor(action_std, dtype=torch.float32)
+                with torch.no_grad():
+                    if hasattr(self.distribution, "std_param"):
+                        self.distribution.std_param.copy_(std)
+                    elif hasattr(self.distribution, "log_std_param"):
+                        self.distribution.log_std_param.copy_(std.log())
 
         self.freeze_base = freeze_base
         if freeze_base:
