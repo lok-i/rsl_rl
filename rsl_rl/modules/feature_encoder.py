@@ -29,17 +29,23 @@ class FeatureEncoder(nn.Module):
         hidden_dims: tuple[int, ...] | list[int] = (256,),
         activation: str = "elu",
         obs_normalization: bool = True,
+        layer_norm: bool = False,
     ) -> None:
-        """Initialize the encoder from the raw feature dim and the desired latent dim."""
+        """Initialize the encoder from the raw feature dim and the desired latent dim.
+
+        ``layer_norm`` normalizes the latent's scale so z cannot be drowned by (or drown) the
+        empirically-normalized plain groups it is concatenated with downstream.
+        """
         super().__init__()
         self.input_dim = input_dim
         self.latent_dim = latent_dim
         self.normalizer = EmpiricalNormalization(input_dim) if obs_normalization else nn.Identity()
         self.mlp = MLP(input_dim, latent_dim, hidden_dims, activation)
+        self.out_norm = nn.LayerNorm(latent_dim) if layer_norm else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Project normalized features to the latent."""
-        return self.mlp(self.normalizer(x))
+        return self.out_norm(self.mlp(self.normalizer(x)))
 
     def update_normalization(self, x: torch.Tensor) -> None:
         """Update the input-normalization statistics."""

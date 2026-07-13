@@ -254,9 +254,10 @@ class PPO:
                         torch.distributed.broadcast(lr_tensor, src=0)
                         self.learning_rate = lr_tensor.item()
 
-                    # Update the learning rate for all parameter groups
+                    # Update the learning rate for all parameter groups (fixed-LR groups keep theirs)
                     for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
+                        if not param_group.get("fixed_lr", False):
+                            param_group["lr"] = self.learning_rate
 
             # Surrogate loss
             ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore

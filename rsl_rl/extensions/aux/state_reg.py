@@ -22,10 +22,9 @@ class StateRegAux(AuxObjective):
     """Regress a privileged (noise-free) state slice from the feature latent.
 
     The engineered-relevance filter — and the cheapest probe of whether the features carry
-    the designated state at all.
+    the designated state at all. Deliberately dynamics-free (unroll_steps = 0): its value as
+    the control variant is measuring decodability with no temporal machinery.
     """
-
-    requires_next = False
 
     def __init__(
         self,
@@ -37,6 +36,7 @@ class StateRegAux(AuxObjective):
         **kwargs: Any,
     ) -> None:
         """Initialize the regression objective; extra kwargs go to :class:`AuxObjective`."""
+        kwargs["unroll_steps"] = 0
         obs: TensorDict = storage.observations
         encoder = actor.encoders[feat_group]
         self.target_slices = self._resolve_slices(obs[target_group].shape[-1], target_slices)

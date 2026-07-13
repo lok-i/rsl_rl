@@ -8,7 +8,7 @@
 An auxiliary objective trains the actor's :class:`~rsl_rl.modules.FeatureEncoder` (plus its own
 predictor head) with a supervised or self-supervised loss, complementary to PPO returns. It is
 invoked by :class:`~rsl_rl.algorithms.PPOAux` after each PPO update and reads temporally-ordered
-``(obs_t, a_t, obs_t+1)`` views straight from the rollout storage — no extra buffers.
+``(obs_t, a_t, ..., obs_t+K)`` views straight from the rollout storage — no extra buffers.
 """
 
 from __future__ import annotations
@@ -30,9 +30,6 @@ class AuxObjective(nn.Module):
     ``update(storage, actor) -> metrics``.
     """
 
-    requires_next: bool = True
-    """Whether the loss needs t+1 data (temporal pairing with done-masking)."""
-
     def __init__(
         self,
         storage: RolloutStorage,
@@ -46,15 +43,22 @@ class AuxObjective(nn.Module):
         num_epochs: int = 1,
         num_mini_batches: int = 4,
         max_grad_norm: float = 1.0,
+        unroll_steps: int = 1,
         device: str = "cpu",
     ) -> None:
-        """Initialize the predictor and common hyperparameters; subclasses call ``_finalize`` last."""
+        """Initialize the predictor and common hyperparameters; subclasses call ``_finalize`` last.
+
+        ``unroll_steps`` is the prediction horizon K: minibatch samples are window starts t whose
+        K transitions are reset-free, and ``_loss`` may index ``idx + k * num_envs`` for any
+        k <= K. K = 0 means no temporal structure (every stored step is a sample).
+        """
         super().__init__()
         self.feat_group = feat_group
         self.learning_rate = learning_rate
         self.num_epochs = num_epochs
         self.num_mini_batches = num_mini_batches
         self.max_grad_norm = max_grad_norm
+        self.unroll_steps = unroll_steps
         self.device = device
         self.predictor = MLP(predictor_input_dim, predictor_output_dim, predictor_hidden_dims, activation)
         # Tuple hides the reference from Module registration: the actor owns the encoder,
@@ -77,11 +81,12 @@ class AuxObjective(nn.Module):
         flat = {g: storage.observations[g].flatten(0, 1) for g in self._obs_keys()}
         actions = storage.actions.flatten(0, 1)
 
-        # Flat index of (t, n) is t * num_envs + n, so idx + num_envs addresses t+1 for the
-        # same env. Pairs crossing an episode reset (done at t) are dropped.
-        if self.requires_next:
-            valid = storage.dones[:-1].flatten(0, 1).squeeze(-1) == 0
-            indices = torch.arange((num_t - 1) * num_envs, device=valid.device)[valid]
+        # Flat index of (t, n) is t * num_envs + n, so idx + k * num_envs addresses t+k for the
+        # same env. A K-step window starting at t is valid iff no done occurs in [t, t+K).
+        if self.unroll_steps > 0:
+            dones = storage.dones.squeeze(-1)[: num_t - 1]
+            valid = dones.unfold(0, self.unroll_steps, 1).sum(-1) == 0  # (num_t - K, num_envs)
+            indices = torch.arange(valid.numel(), device=valid.device)[valid.flatten(0, 1)]
         else:
             indices = torch.arange(num_t * num_envs, device=storage.dones.device)
 
@@ -106,7 +111,24 @@ class AuxObjective(nn.Module):
                 for key, value in metrics.items():
                     totals[key] = totals.get(key, 0.0) + value
                 num_updates += 1
-        return {key: value / num_updates for key, value in totals.items()}
+        out = {key: value / num_updates for key, value in totals.items()}
+        out.update(self._latent_metrics(flat[self.feat_group]))
+        return out
+
+    @torch.no_grad()
+    def _latent_metrics(self, feats: torch.Tensor, max_samples: int = 4096) -> dict[str, float]:
+        """Capacity/collapse diagnostics of the latent z over a rollout sample.
+
+        RankMe (Garrido et al. 2023): exp-entropy of the normalized singular-value spectrum —
+        the effective number of independent dimensions z actually uses (elbow-plot metric for
+        latent_dim ablations). z_std: mean per-dim std, the cheap collapse alarm.
+        """
+        sample = feats[torch.randperm(feats.shape[0], device=feats.device)[:max_samples]]
+        z = self.encoder(sample)
+        sv = torch.linalg.svdvals(z.float())
+        p = sv / sv.sum() + 1e-12
+        rankme = torch.exp(-(p * p.log()).sum())
+        return {"aux/z_rankme": rankme.item(), "aux/z_std": z.std(dim=0).mean().item()}
 
     # --- subclass interface ---
 
@@ -117,7 +139,7 @@ class AuxObjective(nn.Module):
     def _loss(
         self, flat: dict[str, torch.Tensor], actions: torch.Tensor, idx: torch.Tensor, num_envs: int
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Compute the minibatch loss and scalar metrics. ``idx + num_envs`` indexes t+1."""
+        """Compute the minibatch loss and scalar metrics. ``idx + k * num_envs`` indexes t+k."""
         raise NotImplementedError
 
     def _post_step(self) -> None:
