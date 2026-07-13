@@ -30,14 +30,27 @@ class PPOAux(PPO):
     storage template and the actor's encoder handle; the algorithm is otherwise agnostic
     to the objective's nature (SL vs SSL).
 
-    If ``encoder_lr`` is set, the actor's encoder parameters are moved to a fixed-LR group in
-    PPO's optimizer: the adaptive-KL schedule (which swings 1e-5..1e-2) no longer applies to
-    the representation, so PPO cannot shout over the aux objective at 10x its learning rate.
+    Who trains the encoder is configurable per the parent implementations:
+
+    - ``encoder_in_ppo=True, encoder_lr=<float>`` — co-training (multimodal_rl style): the
+      encoder sits in a fixed-LR group of PPO's optimizer (the adaptive-KL schedule, which
+      swings 1e-5..1e-2, no longer applies to the representation) AND in the aux Adam.
+    - ``encoder_in_ppo=False`` — aux-only (OpenTrack/AnyAdapter default): the encoder is
+      evicted from PPO's optimizer entirely; only the aux objective trains it.
+
     Encoder gradient RMS norms are logged per source (``aux/enc_grad_{ppo,aux}``) to make the
-    PPO-vs-aux tug-of-war on the shared representation observable.
+    PPO-vs-aux tug-of-war on the shared representation observable (with ``encoder_in_ppo=
+    False`` the ppo entry should read ~0 — a built-in eviction check).
     """
 
-    def __init__(self, *args: Any, aux_cfg: dict, encoder_lr: float | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        aux_cfg: dict,
+        encoder_lr: float | None = None,
+        encoder_in_ppo: bool = True,
+        **kwargs: Any,
+    ) -> None:
         """Initialize PPO and construct the auxiliary objective from ``aux_cfg``."""
         super().__init__(*args, **kwargs)
         cfg = dict(aux_cfg)
@@ -46,20 +59,17 @@ class PPOAux(PPO):
         self.aux.to(self.device)
 
         encoder_params = [p for enc in self._raw_actor.encoders.values() for p in enc.parameters()]
-        if encoder_lr is not None:
-            # Rebuild the PPO optimizer with the encoder in its own fixed-LR group
-            # (see the ``fixed_lr`` guard in PPO.update's adaptive-KL block).
+        if not encoder_in_ppo or encoder_lr is not None:
             encoder_ids = {id(p) for p in encoder_params}
             rest = [
                 p for p in chain(self._raw_actor.parameters(), self._raw_critic.parameters())
                 if id(p) not in encoder_ids
             ]
-            self.optimizer = type(self.optimizer)(
-                [
-                    {"params": rest, "lr": self.learning_rate},
-                    {"params": encoder_params, "lr": encoder_lr, "fixed_lr": True},
-                ]
-            )
+            groups = [{"params": rest, "lr": self.learning_rate}]
+            if encoder_in_ppo:
+                # Fixed-LR group (see the ``fixed_lr`` guard in PPO.update's adaptive-KL block).
+                groups.append({"params": encoder_params, "lr": encoder_lr, "fixed_lr": True})
+            self.optimizer = type(self.optimizer)(groups)
 
         # Per-source encoder grad-norm accumulators, fed by post-accumulate-grad hooks. The
         # phase flag attributes each backward pass to PPO or the aux objective; norms are
