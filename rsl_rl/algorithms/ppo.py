@@ -290,6 +290,9 @@ class PPO:
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
             loss.backward()
+            # Extension seam: subclasses may accumulate extra gradients into the same step
+            # (e.g. PPOAux joint mode — equivalent to loss += extra, but separately tagged).
+            self._extra_backward()
             # Compute the gradients for RND
             if self.rnd:
                 self.rnd.optimizer.zero_grad()
@@ -356,6 +359,10 @@ class PPO:
         self.storage.clear()
 
         return loss_dict, info_dict
+
+    def _extra_backward(self) -> None:
+        """Accumulate extra per-minibatch gradients before the optimizer step. No-op for PPO."""
+        pass
 
     def train_mode(self) -> None:
         """Set train mode for learnable models."""

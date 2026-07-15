@@ -22,19 +22,20 @@ from .base import AuxObjective
 class LatentFdAux(AuxObjective):
     """Action-conditioned K-step latent prediction against a slow (EMA) target encoder.
 
-    multimodal_rl's ``ForwardDynamics`` mechanics: residual transition
-    ``z' = z + mlp([z, a])``, projector on the prediction side only, plain MSE against the raw
-    EMA-encoder latent of the true next feature (no target projector, no normalization), EMA
-    updated per optimizer step. The recursion state IS z — the controllability filter: the
-    representation must encode what is predictable under the agent's own actions. The EMA
-    target is anti-collapse plumbing, not grounding.
+    multimodal_rl's ``ForwardDynamics`` mechanics: residual transition ``z' = z + mlp([z, a])``,
+    projector on the prediction side only, plain MSE against the raw EMA-encoder latent of the
+    true next feature (no target projector, no normalization), EMA updated per gradient step.
+    The recursion state IS z — the controllability filter: the representation must encode what
+    is predictable under the agent's own actions. The EMA target is anti-collapse plumbing,
+    not grounding.
 
-    One deliberate deviation, flagged: the reference teacher-forces its sequence loss (every
-    step re-encodes the true obs; 1-step FD summed over the window — the temporal-smoothness
-    shortcut applies, but the encoder gets a gradient path at every step).
-    ``autoregressive=True`` (default) instead feeds the prediction back open-loop for
-    ``unroll_steps`` — multi-step in the latent space proper. Actions are the executed rollout
-    actions ``a_{t+k}`` either way.
+    Loss composition (``autoregressive=True``): ``L = (Σ_k L_TF^k + Σ_{k>1} L_AR^k) / (2K-1)``
+    — the teacher-forced sum is the reference loss verbatim (fresh-encoded true ``z_k`` each
+    step: K encoder gradient paths per window), and the open-loop chain (prediction fed back
+    from ``z_0``) adds the multi-step consistency the reference lacks. A pure open-loop unroll
+    gives the encoder only ONE gradient path (through ``z_0``) and mostly trains the transition
+    — the wave-2 failure mode. ``autoregressive=False`` is reference-exact (TF only). Actions
+    are the executed rollout actions ``a_{t+k}`` in both branches.
     """
 
     def __init__(
@@ -75,30 +76,39 @@ class LatentFdAux(AuxObjective):
     def _obs_keys(self) -> list[str]:
         return [self.feat_group]
 
+    def _step(self, z: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """Residual transition (reference DynamicsMLP predicts the state difference)."""
+        return z + self.transition(torch.cat([z, action], dim=-1))
+
     def _loss(
         self, flat: dict[str, torch.Tensor], actions: torch.Tensor, idx: torch.Tensor, num_envs: int
     ) -> tuple[torch.Tensor, dict[str, float]]:
         feats = flat[self.feat_group]
-        z = self.encoder(feats[idx])
-        losses, metrics = [], {}
+        losses_tf, losses_ar, metrics = [], [], {}
         with torch.no_grad():
-            target = self.ema_encoder(feats[idx + num_envs])
             # Do-nothing floor: distance between consecutive targets. A learned loss that only
             # matches this is exploiting temporal smoothness, not dynamics.
-            floor = functional.mse_loss(self.ema_encoder(feats[idx]), target)
-            metrics["aux/latent_floor"] = floor.item()
+            tgt_prev = self.ema_encoder(feats[idx])
+            tgt_next = self.ema_encoder(feats[idx + num_envs])
+            metrics["latent_floor"] = functional.mse_loss(tgt_prev, tgt_next).item()
+        z_ar = None
         for k in range(self.unroll_steps):
-            z_in = z if (self.autoregressive or k == 0) else self.encoder(feats[idx + k * num_envs])
-            # Residual transition (reference DynamicsMLP predicts the state difference).
-            z = z_in + self.transition(torch.cat([z_in, actions[idx + k * num_envs]], dim=-1))
-            if k > 0:
-                with torch.no_grad():
-                    target = self.ema_encoder(feats[idx + (k + 1) * num_envs])
-            step_loss = functional.mse_loss(self.predictor(z), target)
-            losses.append(step_loss)
-            metrics[f"aux/latent_k{k + 1}_mse"] = step_loss.item()
-        loss = torch.stack(losses).mean()
-        metrics["aux/latent_mse"] = loss.item()
+            action = actions[idx + k * num_envs]
+            with torch.no_grad():
+                target = self.ema_encoder(feats[idx + (k + 1) * num_envs]) if k > 0 else tgt_next
+            # TF branch (reference-exact): fresh-encoded true z_k, 1-step prediction.
+            z_tf = self.encoder(feats[idx + k * num_envs])
+            losses_tf.append(functional.mse_loss(self.predictor(self._step(z_tf, action)), target))
+            # AR branch (deviation): open-loop chain from z_0, multi-step consistency.
+            if self.autoregressive:
+                z_ar = self._step(z_tf if k == 0 else z_ar, action)
+                if k > 0:  # k = 0 is identical to the TF term — count it once
+                    losses_ar.append(functional.mse_loss(self.predictor(z_ar), target))
+        loss = torch.stack(losses_tf + losses_ar).mean()
+        metrics["loss/latent_mse"] = loss.item()
+        metrics["latent_tf_mse"] = torch.stack(losses_tf).mean().item()
+        if losses_ar:
+            metrics["latent_ar_mse"] = torch.stack(losses_ar).mean().item()
         return loss, metrics
 
     def _post_step(self) -> None:

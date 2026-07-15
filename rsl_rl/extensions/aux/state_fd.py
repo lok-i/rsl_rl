@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Grounded state-space forward dynamics: SL, full-rollout autoregression in physical state space."""
+"""Grounded state-space forward dynamics: SL, K-step autoregression in physical state space."""
 
 from __future__ import annotations
 
@@ -19,23 +19,23 @@ from .base import AuxObjective
 
 
 class StateFdAux(AuxObjective):
-    """Autoregress the physical state across the whole rollout: ``(ŝ_t, z_t, cond_t, a_t) -> ŝ_{t+1}``.
+    """Autoregress the physical state over K-step windows: ``(ŝ_k, z_k, cond_k, a_k) -> ŝ_{k+1}``.
 
     AnyAdapter's autoregressive world model (OpenTrack ``compute_world_model_loss``,
     ``world_model_autoregressive=True``), state-for-state: the recursion state is the *physical*
-    state (z is a per-step measurement input), seeded with the TRUE state at the window start,
-    predictions fed back over all T rollout steps in one scan, and episode resets handled by
-    masking the loss at done steps and resetting the carry to the true post-reset state (no
-    window masking). Minibatches are env columns — the time axis stays whole, one backward
-    through the full scan. Deviations from the reference: the encoder reads the real image
-    feature at each step (future images cannot be imagined, unlike their proprio history), and
-    the loss is normalized MSE instead of per-slice-weighted L1 (the target normalizer plays
-    the weights' role and keeps the same lens as StateRegAux).
+    state (z is a per-step measurement input); the rollout is chunked into ``unroll_steps``-long
+    windows (reference ``unroll_length=10``), each seeded with the TRUE state at its start,
+    predictions fed back across the window, episode resets handled by masking the loss at done
+    steps and resetting the carry to the true post-reset state (no window masking). Loss is L1
+    on normalized targets (reference: per-slice-weighted L1 — the normalizer plays the weights'
+    role). Minibatches are env columns — the time axis of each window stays whole, one backward
+    through all windows. Deviation from the reference: the encoder reads the real image feature
+    at each step (future images cannot be imagined, unlike their proprio history).
 
-    The true-s seed makes step 1 nearly image-free (dead reckoning), but autoregression decay
-    over T steps means the image is the only error-correcting input for the rest of the window.
-    Keep the target slices to the image-dependent state (object) and let the conditioning
-    (proprio/command) supply the robot side.
+    The true-s seed makes the first window steps nearly image-free (dead reckoning); the
+    later steps are only correctable through z. Keep the target slices to the image-dependent
+    state (object) and condition on the robot slice only (object state in the input would
+    bypass the image).
     """
 
     def __init__(
@@ -44,17 +44,15 @@ class StateFdAux(AuxObjective):
         actor: nn.Module,
         feat_group: str = "img_feat",
         target_group: str = "aux_state",
-        condition_groups: tuple[str, ...] | list[str] = (),
         target_slices: dict[str, tuple[int, int]] | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the state-FD objective; extra kwargs go to :class:`AuxObjective`."""
-        kwargs["unroll_steps"] = 0  # horizon = whole rollout; base window indexing unused
         obs: TensorDict = storage.observations
         encoder = actor.encoders[feat_group]
         self.target_slices = self._resolve_slices(obs[target_group].shape[-1], target_slices)
         target_dim = sum(b - a for a, b in self.target_slices.values())
-        cond_dim = sum(obs[g].shape[-1] for g in condition_groups)
+        cond_dim = self.cond_dim_of(obs, kwargs.get("condition_group"), kwargs.get("condition_slices"))
         action_dim = storage.actions.shape[-1]
         super().__init__(
             storage=storage,
@@ -64,30 +62,44 @@ class StateFdAux(AuxObjective):
             feat_group=feat_group,
             **kwargs,
         )
+        assert 1 <= self.unroll_steps <= storage.num_transitions_per_env - 1, (
+            f"StateFdAux window ({self.unroll_steps}) must fit the rollout "
+            f"({storage.num_transitions_per_env} steps)."
+        )
         self.target_group = target_group
-        self.condition_groups = list(condition_groups)
-        self.cond_normalizer = EmpiricalNormalization(cond_dim) if cond_dim > 0 else nn.Identity()
         self.target_normalizer = EmpiricalNormalization(target_dim)
         self._finalize()
 
     def _obs_keys(self) -> list[str]:
-        return [self.feat_group, self.target_group, *self.condition_groups]
+        keys = [self.feat_group, self.target_group]
+        if self.condition_group is not None and self.condition_group not in keys:
+            keys.append(self.condition_group)
+        return keys
+
+    def _window_starts(self, num_t: int) -> range:
+        """Disjoint window starts covering the rollout (last partial window dropped)."""
+        return range(0, num_t - self.unroll_steps, self.unroll_steps)
+
+    def sample_loss(self, storage: RolloutStorage) -> tuple[torch.Tensor, dict[str, float]] | None:
+        """One env-column minibatch over all windows (joint mode)."""
+        mini_batch_size = storage.num_envs // self.num_mini_batches
+        if mini_batch_size == 0:
+            return None
+        cols = torch.randint(storage.num_envs, (mini_batch_size,), device=storage.dones.device)
+        return self._scan_loss(storage, cols)
 
     def update(self, storage: RolloutStorage, actor: nn.Module) -> dict[str, float]:
-        """Trajectory minibatching: sample env columns, autoregress over the full time axis."""
-        num_t, num_envs = storage.num_transitions_per_env, storage.num_envs
-        obs = storage.observations
-        mini_batch_size = num_envs // self.num_mini_batches
+        """Sequential mode: env-column minibatches, autoregress over the window'd time axis."""
+        mini_batch_size = storage.num_envs // self.num_mini_batches
         if mini_batch_size == 0:
             return {}
-
         totals: dict[str, float] = {}
         num_updates = 0
         for _ in range(self.num_epochs):
-            perm = torch.randperm(num_envs, device=storage.dones.device)
+            perm = torch.randperm(storage.num_envs, device=storage.dones.device)
             for i in range(self.num_mini_batches):
                 cols = perm[i * mini_batch_size : (i + 1) * mini_batch_size]
-                loss, metrics = self._scan_loss(obs, storage.actions, storage.dones, cols, num_t)
+                loss, metrics = self._scan_loss(storage, cols)
                 self.optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(
@@ -98,43 +110,41 @@ class StateFdAux(AuxObjective):
                     totals[key] = totals.get(key, 0.0) + value
                 num_updates += 1
         out = {key: value / num_updates for key, value in totals.items()}
-        out.update(self._latent_metrics(obs[self.feat_group].flatten(0, 1)))
+        out.update(self.latent_metrics(storage.observations[self.feat_group].flatten(0, 1)))
         return out
 
-    def _scan_loss(
-        self, obs: TensorDict, actions: torch.Tensor, dones: torch.Tensor, cols: torch.Tensor, num_t: int
-    ) -> tuple[torch.Tensor, dict[str, float]]:
+    def _scan_loss(self, storage: RolloutStorage, cols: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
+        obs, num_t = storage.observations, storage.num_transitions_per_env
         target = self._select_target(obs[self.target_group][:, cols])  # (T, mb, D), true states
         self.target_normalizer.update(target.flatten(0, 1))
         target = self.target_normalizer(target)
-        cond = None
-        if self.condition_groups:
-            cond = torch.cat([obs[g][:, cols] for g in self.condition_groups], dim=-1)
-            if isinstance(self.cond_normalizer, EmpiricalNormalization):
-                self.cond_normalizer.update(cond.flatten(0, 1))
-            cond = self.cond_normalizer(cond)
-        not_done = 1.0 - dones.squeeze(-1)[:, cols].float()  # (T, mb)
+        cond = self._cond(obs[self.condition_group][:, cols], update_stats=True) if self.condition_group else None
+        not_done = 1.0 - storage.dones.squeeze(-1)[:, cols].float()  # (T, mb)
 
-        s_hat = target[0]  # seed: TRUE state at the window start (reference behavior)
-        step_losses, sq_errs = [], []
-        for t in range(num_t - 1):
-            parts = [s_hat, self.encoder(obs[self.feat_group][t, cols])]
-            if cond is not None:
-                parts.append(cond[t])
-            parts.append(actions[t, cols])
-            s_hat = self.predictor(torch.cat(parts, dim=-1))
-            # Loss masked at resets; carry reset to the true post-reset state (target[t+1] IS
-            # the next observation of step t).
-            sq_err = (s_hat - target[t + 1]).square()
-            mask = not_done[t]
-            step_losses.append((sq_err.mean(-1) * mask).sum() / mask.sum().clamp(min=1.0))
-            sq_errs.append(sq_err[mask.bool()])
-            s_hat = torch.where(not_done[t].unsqueeze(-1).bool(), s_hat, target[t + 1])
+        step_losses, errs = [], []
+        for start in self._window_starts(num_t):
+            s_hat = target[start]  # seed: TRUE state at the window start (reference behavior)
+            for t in range(start, start + self.unroll_steps):
+                parts = [s_hat, self.encoder(obs[self.feat_group][t, cols])]
+                if cond is not None:
+                    parts.append(cond[t])
+                parts.append(storage.actions[t, cols])
+                s_hat = self.predictor(torch.cat(parts, dim=-1))
+                # Loss masked at resets; carry reset to the true post-reset state (target[t+1]
+                # IS the next observation of step t). L1 on normalized targets (reference).
+                err = (s_hat - target[t + 1]).abs()
+                mask = not_done[t]
+                step_losses.append((err.mean(-1) * mask).sum() / mask.sum().clamp(min=1.0))
+                errs.append(err[mask.bool()])
+                s_hat = torch.where(not_done[t].unsqueeze(-1).bool(), s_hat, target[t + 1])
         loss = torch.stack(step_losses).mean()
-        metrics = {"aux/fd_mse": loss.item()}
+        metrics = {"loss/fd_l1": loss.item()}
         with torch.no_grad():
-            half = len(step_losses) // 2
-            metrics["aux/fd_mse_early"] = torch.stack(step_losses[:half]).mean().item()
-            metrics["aux/fd_mse_late"] = torch.stack(step_losses[half:]).mean().item()
-            metrics.update(self._slice_metrics(torch.cat(sq_errs, dim=0), "aux/fd_"))
+            # Early/late halves WITHIN each window: early rides the true-s seed (dead
+            # reckoning), late is image-corrected only — the image-dependence diagnostic.
+            per_window = torch.stack(step_losses).view(-1, self.unroll_steps)
+            half = self.unroll_steps // 2
+            metrics["fd_l1_early"] = per_window[:, :half].mean().item()
+            metrics["fd_l1_late"] = per_window[:, half:].mean().item()
+            metrics.update(self._slice_metrics(torch.cat(errs, dim=0), "fd_l1_"))
         return loss, metrics

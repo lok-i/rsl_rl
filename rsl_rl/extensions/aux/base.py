@@ -7,8 +7,12 @@
 
 An auxiliary objective trains the actor's :class:`~rsl_rl.modules.FeatureEncoder` (plus its own
 predictor head) with a supervised or self-supervised loss, complementary to PPO returns. It is
-invoked by :class:`~rsl_rl.algorithms.PPOAux` after each PPO update and reads temporally-ordered
-``(obs_t, a_t, ..., obs_t+K)`` views straight from the rollout storage — no extra buffers.
+invoked by :class:`~rsl_rl.algorithms.PPOAux` — either after the PPO epochs (``sequential``) or
+as an accumulated gradient inside each PPO minibatch (``joint``) — and reads temporally-ordered
+``(obs_t, a_t, ..., obs_t+K)`` views straight from the rollout storage; no extra buffers.
+
+Metric key convention: ``loss/<name>`` marks the objective's actual loss (routed to the
+``Loss/`` logger section); every other key is a diagnostic (routed to ``Auxiliaries/``).
 """
 
 from __future__ import annotations
@@ -16,8 +20,9 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from itertools import chain
+from tensordict import TensorDict
 
-from rsl_rl.modules import MLP
+from rsl_rl.modules import MLP, EmpiricalNormalization
 from rsl_rl.storage import RolloutStorage
 
 
@@ -26,8 +31,9 @@ class AuxObjective(nn.Module):
 
     Subclasses implement :meth:`_obs_keys` (observation groups they read) and :meth:`_loss`
     (per-minibatch loss + metrics), and call :meth:`_finalize` at the end of their ``__init__``.
-    The algorithm stays agnostic to the objective's nature (SL vs SSL): the whole contract is
-    ``update(storage, actor) -> metrics``.
+    The algorithm stays agnostic to the objective's nature (SL vs SSL): the contract is
+    ``update(storage, actor) -> metrics`` (sequential) or ``sample_loss(storage) -> (loss,
+    metrics)`` (joint — one freshly-sampled minibatch, backward done by the caller).
     """
 
     def __init__(
@@ -44,6 +50,8 @@ class AuxObjective(nn.Module):
         num_mini_batches: int = 4,
         max_grad_norm: float = 1.0,
         unroll_steps: int = 1,
+        condition_group: str | None = None,
+        condition_slices: dict[str, tuple[int, int]] | None = None,
         device: str = "cpu",
     ) -> None:
         """Initialize the predictor and common hyperparameters; subclasses call ``_finalize`` last.
@@ -51,6 +59,10 @@ class AuxObjective(nn.Module):
         ``unroll_steps`` is the prediction horizon K: minibatch samples are window starts t whose
         K transitions are reset-free, and ``_loss`` may index ``idx + k * num_envs`` for any
         k <= K. K = 0 means no temporal structure (every stored step is a sample).
+
+        ``condition_group``/``condition_slices`` select named column ranges of one observation
+        group as a normalized conditioning input (e.g. the noise-free robot slice of
+        ``aux_state`` — never the object slice, which would bypass the image).
         """
         super().__init__()
         self.feat_group = feat_group
@@ -60,6 +72,14 @@ class AuxObjective(nn.Module):
         self.max_grad_norm = max_grad_norm
         self.unroll_steps = unroll_steps
         self.device = device
+        self.condition_group = condition_group
+        if condition_group is not None:
+            obs: TensorDict = storage.observations
+            self.cond_slices = self._resolve_slices(obs[condition_group].shape[-1], condition_slices)
+            self.cond_dim = sum(b - a for a, b in self.cond_slices.values())
+            self.cond_normalizer = EmpiricalNormalization(self.cond_dim)
+        else:
+            self.cond_slices, self.cond_dim, self.cond_normalizer = {}, 0, nn.Identity()
         self.predictor = MLP(predictor_input_dim, predictor_output_dim, predictor_hidden_dims, activation)
         # Tuple hides the reference from Module registration: the actor owns the encoder,
         # so it must not appear in this module's state_dict.
@@ -70,26 +90,57 @@ class AuxObjective(nn.Module):
         """The actor's feature encoder this objective trains."""
         return self._encoder_ref[0]
 
+    @staticmethod
+    def cond_dim_of(obs: TensorDict, group: str | None, slices: dict[str, tuple[int, int]] | None) -> int:
+        """Conditioning width for predictor sizing, resolvable before ``super().__init__``."""
+        if group is None:
+            return 0
+        resolved = AuxObjective._resolve_slices(obs[group].shape[-1], slices)
+        return sum(b - a for a, b in resolved.values())
+
+    def _cond(self, x: torch.Tensor, update_stats: bool) -> torch.Tensor:
+        """Slice-select and normalize conditioning rows ``x`` of the condition group."""
+        cond = torch.cat([x[..., a:b] for a, b in self.cond_slices.values()], dim=-1)
+        if update_stats:
+            self.cond_normalizer.update(cond.reshape(-1, self.cond_dim))
+        return self.cond_normalizer(cond)
+
     def _finalize(self) -> None:
         """Build the optimizer over encoder + own trainable parameters. Call last in subclass init."""
         params = [p for p in chain(self.parameters(), self.encoder.parameters()) if p.requires_grad]
         self.optimizer = torch.optim.Adam(params, lr=self.learning_rate)
 
-    def update(self, storage: RolloutStorage, actor: nn.Module) -> dict[str, float]:
-        """Run optimization epochs over the stored rollout and return mean metrics."""
-        num_t, num_envs = storage.num_transitions_per_env, storage.num_envs
-        flat = {g: storage.observations[g].flatten(0, 1) for g in self._obs_keys()}
-        actions = storage.actions.flatten(0, 1)
+    # --- sampling ---
 
-        # Flat index of (t, n) is t * num_envs + n, so idx + k * num_envs addresses t+k for the
-        # same env. A K-step window starting at t is valid iff no done occurs in [t, t+K).
+    def _flat_views(self, storage: RolloutStorage) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        flat = {g: storage.observations[g].flatten(0, 1) for g in self._obs_keys()}
+        return flat, storage.actions.flatten(0, 1)
+
+    def _valid_indices(self, storage: RolloutStorage) -> torch.Tensor:
+        """Flat (t, n) start indices whose K-step window is reset-free (all steps if K = 0)."""
+        num_t, num_envs = storage.num_transitions_per_env, storage.num_envs
         if self.unroll_steps > 0:
             dones = storage.dones.squeeze(-1)[: num_t - 1]
             valid = dones.unfold(0, self.unroll_steps, 1).sum(-1) == 0  # (num_t - K, num_envs)
-            indices = torch.arange(valid.numel(), device=valid.device)[valid.flatten(0, 1)]
-        else:
-            indices = torch.arange(num_t * num_envs, device=storage.dones.device)
+            return torch.arange(valid.numel(), device=valid.device)[valid.flatten(0, 1)]
+        return torch.arange(num_t * num_envs, device=storage.dones.device)
 
+    def sample_loss(self, storage: RolloutStorage) -> tuple[torch.Tensor, dict[str, float]] | None:
+        """One freshly-sampled minibatch loss (joint mode); caller does backward + step."""
+        flat, actions = self._flat_views(storage)
+        indices = self._valid_indices(storage)
+        mini_batch_size = len(indices) // self.num_mini_batches
+        if mini_batch_size == 0:
+            return None
+        idx = indices[torch.randint(len(indices), (mini_batch_size,), device=indices.device)]
+        return self._loss(flat, actions, idx, storage.num_envs)
+
+    # --- sequential mode ---
+
+    def update(self, storage: RolloutStorage, actor: nn.Module) -> dict[str, float]:
+        """Run optimization epochs over the stored rollout and return mean metrics."""
+        flat, actions = self._flat_views(storage)
+        indices = self._valid_indices(storage)
         mini_batch_size = len(indices) // self.num_mini_batches
         if mini_batch_size == 0:
             return {}
@@ -100,7 +151,7 @@ class AuxObjective(nn.Module):
             perm = indices[torch.randperm(len(indices), device=indices.device)]
             for i in range(self.num_mini_batches):
                 idx = perm[i * mini_batch_size : (i + 1) * mini_batch_size]
-                loss, metrics = self._loss(flat, actions, idx, num_envs)
+                loss, metrics = self._loss(flat, actions, idx, storage.num_envs)
                 self.optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(
@@ -112,23 +163,23 @@ class AuxObjective(nn.Module):
                     totals[key] = totals.get(key, 0.0) + value
                 num_updates += 1
         out = {key: value / num_updates for key, value in totals.items()}
-        out.update(self._latent_metrics(flat[self.feat_group]))
+        out.update(self.latent_metrics(storage.observations[self.feat_group].flatten(0, 1)))
         return out
 
     @torch.no_grad()
-    def _latent_metrics(self, feats: torch.Tensor, max_samples: int = 4096) -> dict[str, float]:
+    def latent_metrics(self, feats: torch.Tensor, max_samples: int = 4096) -> dict[str, float]:
         """Capacity/collapse diagnostics of the latent z over a rollout sample.
 
         RankMe (Garrido et al. 2023): exp-entropy of the normalized singular-value spectrum —
         the effective number of independent dimensions z actually uses (elbow-plot metric for
-        latent_dim ablations). z_std: mean per-dim std, the cheap collapse alarm.
+        latent_dim ablations). latent_std: mean per-dim std, the cheap collapse alarm.
         """
         sample = feats[torch.randperm(feats.shape[0], device=feats.device)[:max_samples]]
         z = self.encoder(sample)
         sv = torch.linalg.svdvals(z.float())
         p = sv / sv.sum() + 1e-12
         rankme = torch.exp(-(p * p.log()).sum())
-        return {"aux/z_rankme": rankme.item(), "aux/z_std": z.std(dim=0).mean().item()}
+        return {"latent_rankme": rankme.item(), "latent_std": z.std(dim=0).mean().item()}
 
     # --- subclass interface ---
 
@@ -143,7 +194,7 @@ class AuxObjective(nn.Module):
         raise NotImplementedError
 
     def _post_step(self) -> None:
-        """Run after each optimizer step (e.g. EMA update). No-op by default."""
+        """Run after each gradient application (e.g. EMA update). No-op by default."""
         pass
 
     # --- helpers for state-target variants ---
@@ -157,8 +208,8 @@ class AuxObjective(nn.Module):
         """Concatenate the configured target slices."""
         return torch.cat([x[..., a:b] for a, b in self.target_slices.values()], dim=-1)
 
-    def _slice_metrics(self, sq_err: torch.Tensor, prefix: str) -> dict[str, float]:
-        """Compute per-slice MSE in normalized target space.
+    def _slice_metrics(self, err: torch.Tensor, prefix: str) -> dict[str, float]:
+        """Per-slice mean error in normalized target space.
 
         Catches e.g. object-state error hiding behind an easy proprio-dominated total.
         """
@@ -167,6 +218,6 @@ class AuxObjective(nn.Module):
         out, offset = {}, 0
         for name, (a, b) in self.target_slices.items():
             width = b - a
-            out[f"{prefix}{name}_mse"] = sq_err[..., offset : offset + width].mean().item()
+            out[f"{prefix}{name}"] = err[..., offset : offset + width].mean().item()
             offset += width
         return out
