@@ -42,14 +42,14 @@ class StateFdAux(AuxObjective):
         self,
         storage: RolloutStorage,
         actor: nn.Module,
-        feat_group: str = "img_feat",
-        target_group: str = "aux_state",
+        target_group: str = "prediction_target",
         target_slices: dict[str, tuple[int, int]] | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the state-FD objective; extra kwargs go to :class:`AuxObjective`."""
+        kwargs.setdefault("condition_group", "prediction_conditioning")
         obs: TensorDict = storage.observations
-        encoder = actor.encoders[feat_group]
+        extractor = actor.extractors[kwargs.get("extractor_group", "extractor_input")]
         self.target_slices = self._resolve_slices(obs[target_group].shape[-1], target_slices)
         target_dim = sum(b - a for a, b in self.target_slices.values())
         cond_dim = self.cond_dim_of(obs, kwargs.get("condition_group"), kwargs.get("condition_slices"))
@@ -57,9 +57,8 @@ class StateFdAux(AuxObjective):
         super().__init__(
             storage=storage,
             actor=actor,
-            predictor_input_dim=target_dim + encoder.latent_dim + cond_dim + action_dim,
+            predictor_input_dim=target_dim + extractor.latent_dim + cond_dim + action_dim,
             predictor_output_dim=target_dim,
-            feat_group=feat_group,
             **kwargs,
         )
         assert 1 <= self.unroll_steps <= storage.num_transitions_per_env - 1, (
@@ -71,7 +70,7 @@ class StateFdAux(AuxObjective):
         self._finalize()
 
     def _obs_keys(self) -> list[str]:
-        keys = [self.feat_group, self.target_group]
+        keys = [self.target_group]
         if self.condition_group is not None and self.condition_group not in keys:
             keys.append(self.condition_group)
         return keys
@@ -110,7 +109,7 @@ class StateFdAux(AuxObjective):
                     totals[key] = totals.get(key, 0.0) + value
                 num_updates += 1
         out = {key: value / num_updates for key, value in totals.items()}
-        out.update(self.latent_metrics(storage.observations[self.feat_group].flatten(0, 1)))
+        out.update(self.latent_metrics(storage))
         return out
 
     def _scan_loss(self, storage: RolloutStorage, cols: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
@@ -125,7 +124,7 @@ class StateFdAux(AuxObjective):
         for start in self._window_starts(num_t):
             s_hat = target[start]  # seed: TRUE state at the window start (reference behavior)
             for t in range(start, start + self.unroll_steps):
-                parts = [s_hat, self.encoder(obs[self.feat_group][t, cols])]
+                parts = [s_hat, self._encode(obs, (t, cols))]
                 if cond is not None:
                     parts.append(cond[t])
                 parts.append(storage.actions[t, cols])

@@ -28,12 +28,12 @@ class PPOAux(PPO):
       accumulated ``aux_weight * aux_loss`` backward on a freshly-sampled aux minibatch —
       mathematically ``loss_ppo + aux_weight * aux_loss``, one optimizer step, one Adam per
       parameter, and the aux gets a gradient at EVERY PPO step. The optimizer is rebuilt with
-      three groups: actor+critic (adaptive-KL LR), encoder (fixed ``encoder_lr``), aux heads
+      three groups: actor+critic (adaptive-KL LR), encoder (fixed ``extractor_lr``), aux heads
       (fixed aux LR) — the ``fixed_lr`` guard in PPO.update keeps the schedule off the last two.
     - ``"sequential"`` (OpenTrack style): the aux objective runs its own optimizer for
       ``num_epochs x num_mini_batches`` steps *after* the PPO epochs (reads the storage
-      directly — ``storage.clear()`` only resets the write cursor). ``encoder_in_ppo`` /
-      ``encoder_lr`` control whether PPO co-trains the encoder (fixed-LR group) or not at all.
+      directly — ``storage.clear()`` only resets the write cursor). ``extractor_in_ppo`` /
+      ``extractor_lr`` control whether PPO co-trains the encoder (fixed-LR group) or not at all.
 
     Encoder gradient RMS norms are logged per source plus their fraction
     (``enc_grad_frac = aux / (ppo + aux)``, 0.5 = parity) — the tug-of-war on the shared
@@ -50,8 +50,8 @@ class PPOAux(PPO):
         aux_cfg: dict,
         aux_mode: str = "sequential",
         aux_weight: float = 1.0,
-        encoder_lr: float | None = None,
-        encoder_in_ppo: bool = True,
+        extractor_lr: float | None = None,
+        extractor_in_ppo: bool = True,
         **kwargs: Any,
     ) -> None:
         """Initialize PPO and construct the auxiliary objective from ``aux_cfg``."""
@@ -64,11 +64,11 @@ class PPOAux(PPO):
         self.aux = aux_class(storage=self.storage, actor=self._raw_actor, device=self.device, **cfg)
         self.aux.to(self.device)
 
-        encoder_params = [p for enc in self._raw_actor.encoders.values() for p in enc.parameters()]
-        encoder_ids = {id(p) for p in encoder_params}
+        extractor_params = [p for enc in self._raw_actor.extractors.values() for p in enc.parameters()]
+        extractor_ids = {id(p) for p in extractor_params}
         rest = [
             p for p in chain(self._raw_actor.parameters(), self._raw_critic.parameters())
-            if id(p) not in encoder_ids
+            if id(p) not in extractor_ids
         ]
         if aux_mode == "joint":
             # One optimizer, one Adam per param; aux head params join it (their own aux Adam
@@ -77,14 +77,14 @@ class PPOAux(PPO):
             self.optimizer = type(self.optimizer)(
                 [
                     {"params": rest, "lr": self.learning_rate},
-                    {"params": encoder_params, "lr": encoder_lr or self.aux.learning_rate, "fixed_lr": True},
+                    {"params": extractor_params, "lr": extractor_lr or self.aux.learning_rate, "fixed_lr": True},
                     {"params": aux_params, "lr": self.aux.learning_rate, "fixed_lr": True},
                 ]
             )
-        elif not encoder_in_ppo or encoder_lr is not None:
+        elif not extractor_in_ppo or extractor_lr is not None:
             groups = [{"params": rest, "lr": self.learning_rate}]
-            if encoder_in_ppo:
-                groups.append({"params": encoder_params, "lr": encoder_lr, "fixed_lr": True})
+            if extractor_in_ppo:
+                groups.append({"params": extractor_params, "lr": extractor_lr, "fixed_lr": True})
             self.optimizer = type(self.optimizer)(groups)
 
         # Per-source encoder grad-norm accumulators, fed by post-accumulate-grad hooks. The
@@ -93,13 +93,13 @@ class PPOAux(PPO):
         self._grad_phase: str | None = None
         self._grad_sq = {"ppo": torch.zeros((), device=self.device), "aux": torch.zeros((), device=self.device)}
         self._grad_passes = {"ppo": 0, "aux": 0}
-        self._pass_marker = encoder_params[0] if encoder_params else None
-        for p in encoder_params:
-            p.register_post_accumulate_grad_hook(self._encoder_grad_hook)
+        self._pass_marker = extractor_params[0] if extractor_params else None
+        for p in extractor_params:
+            p.register_post_accumulate_grad_hook(self._extractor_grad_hook)
         self._aux_totals: dict[str, float] = {}
         self._aux_calls = 0
 
-    def _encoder_grad_hook(self, param: torch.Tensor) -> None:
+    def _extractor_grad_hook(self, param: torch.Tensor) -> None:
         if self._grad_phase is None or param.grad is None:
             return
         self._grad_sq[self._grad_phase] += param.grad.detach().square().sum()
@@ -140,7 +140,7 @@ class PPOAux(PPO):
         loss_dict, info_dict = super().update()  # joint mode runs aux via _extra_backward
         if self.aux_mode == "joint":
             aux_metrics = {k: v / self._aux_calls for k, v in self._aux_totals.items()} if self._aux_calls else {}
-            aux_metrics.update(self.aux.latent_metrics(self.storage.observations[self.aux.feat_group].flatten(0, 1)))
+            aux_metrics.update(self.aux.latent_metrics(self.storage))
         else:
             self._grad_phase = "aux"
             aux_metrics = self.aux.update(self.storage, self._raw_actor)
