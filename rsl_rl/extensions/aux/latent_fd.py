@@ -42,7 +42,6 @@ class LatentFdAux(AuxObjective):
         self,
         storage: RolloutStorage,
         actor: nn.Module,
-        feat_group: str = "img_feat",
         ema_tau: float = 0.99,
         autoregressive: bool = True,
         transition_hidden_dims: tuple[int, ...] | list[int] = (512, 256),
@@ -53,28 +52,29 @@ class LatentFdAux(AuxObjective):
         The base predictor is the projector (reference: Linear-ELU-Linear, set
         ``predictor_hidden_dims`` accordingly at the call site).
         """
-        encoder = actor.encoders[feat_group]
+        extractor = actor.extractors[kwargs.get("extractor_group", "extractor_input")]
         action_dim = storage.actions.shape[-1]
-        kwargs.setdefault("predictor_hidden_dims", (encoder.latent_dim,))
+        kwargs.setdefault("predictor_hidden_dims", (extractor.latent_dim,))
         super().__init__(
             storage=storage,
             actor=actor,
-            predictor_input_dim=encoder.latent_dim,
-            predictor_output_dim=encoder.latent_dim,
-            feat_group=feat_group,
+            predictor_input_dim=extractor.latent_dim,
+            predictor_output_dim=extractor.latent_dim,
             **kwargs,
         )
         assert self.unroll_steps >= 1, "LatentFdAux needs unroll_steps >= 1."
         self.ema_tau = ema_tau
         self.autoregressive = autoregressive
         activation = kwargs.get("activation", "elu")
-        self.transition = MLP(encoder.latent_dim + action_dim, encoder.latent_dim, transition_hidden_dims, activation)
-        self.ema_encoder = copy.deepcopy(encoder)
-        self.ema_encoder.requires_grad_(False)
+        self.transition = MLP(
+            extractor.latent_dim + action_dim, extractor.latent_dim, transition_hidden_dims, activation
+        )
+        self.ema_extractor = copy.deepcopy(extractor)
+        self.ema_extractor.requires_grad_(False)
         self._finalize()
 
     def _obs_keys(self) -> list[str]:
-        return [self.feat_group]
+        return []
 
     def _step(self, z: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         """Residual transition (reference DynamicsMLP predicts the state difference)."""
@@ -83,21 +83,22 @@ class LatentFdAux(AuxObjective):
     def _loss(
         self, flat: dict[str, torch.Tensor], actions: torch.Tensor, idx: torch.Tensor, num_envs: int
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        feats = flat[self.feat_group]
         losses_tf, losses_ar, metrics = [], [], {}
         with torch.no_grad():
             # Do-nothing floor: distance between consecutive targets. A learned loss that only
             # matches this is exploiting temporal smoothness, not dynamics.
-            tgt_prev = self.ema_encoder(feats[idx])
-            tgt_next = self.ema_encoder(feats[idx + num_envs])
+            tgt_prev = self._encode(flat, idx, extractor=self.ema_extractor)
+            tgt_next = self._encode(flat, idx + num_envs, extractor=self.ema_extractor)
             metrics["latent_floor"] = functional.mse_loss(tgt_prev, tgt_next).item()
         z_ar = None
         for k in range(self.unroll_steps):
             action = actions[idx + k * num_envs]
             with torch.no_grad():
-                target = self.ema_encoder(feats[idx + (k + 1) * num_envs]) if k > 0 else tgt_next
+                target = (
+                    self._encode(flat, idx + (k + 1) * num_envs, extractor=self.ema_extractor) if k > 0 else tgt_next
+                )
             # TF branch (reference-exact): fresh-encoded true z_k, 1-step prediction.
-            z_tf = self.encoder(feats[idx + k * num_envs])
+            z_tf = self._encode(flat, idx + k * num_envs)
             losses_tf.append(functional.mse_loss(self.predictor(self._step(z_tf, action)), target))
             # AR branch (deviation): open-loop chain from z_0, multi-step consistency.
             if self.autoregressive:
@@ -113,8 +114,8 @@ class LatentFdAux(AuxObjective):
 
     def _post_step(self) -> None:
         with torch.no_grad():
-            for p_ema, p in zip(self.ema_encoder.parameters(), self.encoder.parameters()):
+            for p_ema, p in zip(self.ema_extractor.parameters(), self.extractor.parameters()):
                 p_ema.lerp_(p, 1.0 - self.ema_tau)
             # Normalizer statistics track the live encoder directly (they are slow-moving already).
-            for b_ema, b in zip(self.ema_encoder.buffers(), self.encoder.buffers()):
+            for b_ema, b in zip(self.ema_extractor.buffers(), self.extractor.buffers()):
                 b_ema.copy_(b)

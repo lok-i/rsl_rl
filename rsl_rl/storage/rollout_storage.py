@@ -138,12 +138,19 @@ class RolloutStorage:
         self.num_envs = num_envs
         self.actions_shape = actions_shape
 
-        # Core
+        # Core. Nested groups (concatenate_terms=False -> a TensorDict of terms) recurse:
+        # their .shape is the batch size, not a leaf shape.
+        def _zeros_stacked(value: torch.Tensor | TensorDict) -> torch.Tensor | TensorDict:
+            if isinstance(value, TensorDict):
+                return TensorDict(
+                    {key: _zeros_stacked(term) for key, term in value.items()},
+                    batch_size=[num_transitions_per_env, *value.batch_size],
+                    device=device,
+                )
+            return torch.zeros(num_transitions_per_env, *value.shape, dtype=value.dtype, device=device)
+
         self.observations = TensorDict(
-            {
-                key: torch.zeros(num_transitions_per_env, *value.shape, dtype=value.dtype, device=device)
-                for key, value in obs.items()
-            },
+            {key: _zeros_stacked(value) for key, value in obs.items()},
             batch_size=[num_transitions_per_env, num_envs],
             device=self.device,
         )

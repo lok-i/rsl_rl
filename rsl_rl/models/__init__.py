@@ -6,10 +6,10 @@
 """Neural models for the learning algorithm."""
 
 from .cnn_model import CNNModel
-from .feature_encoder_model import (
-    FeatureEncoderAdapterModel,
-    FeatureEncoderMLPModel,
-    FeatureEncoderSonicAdapterModel,
+from .extractor_model import (
+    ExtractorAdapterModel,
+    ExtractorMLPModel,
+    ExtractorSonicAdapterModel,
 )
 from .mlp_adapter_model import MLPWithAdapterModel, ModularNormMLPWithAdapterModel
 from .mlp_model import MLPModel, ModularNormMLPModel
@@ -20,9 +20,9 @@ from .sonic_base_model import SonicBaseModel
 
 __all__ = [
     "CNNModel",
-    "FeatureEncoderAdapterModel",
-    "FeatureEncoderMLPModel",
-    "FeatureEncoderSonicAdapterModel",
+    "ExtractorAdapterModel",
+    "ExtractorMLPModel",
+    "ExtractorSonicAdapterModel",
     "MLPModel",
     "MLPWithAdapterModel",
     "MLPWithSidecarModel",

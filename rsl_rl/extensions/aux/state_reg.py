@@ -35,24 +35,23 @@ class StateRegAux(AuxObjective):
         self,
         storage: RolloutStorage,
         actor: nn.Module,
-        feat_group: str = "img_feat",
-        target_group: str = "aux_state",
+        target_group: str = "prediction_target",
         target_slices: dict[str, tuple[int, int]] | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the regression objective; extra kwargs go to :class:`AuxObjective`."""
+        kwargs.setdefault("condition_group", "prediction_conditioning")
         kwargs["unroll_steps"] = 0
         obs: TensorDict = storage.observations
-        encoder = actor.encoders[feat_group]
+        extractor = actor.extractors[kwargs.get("extractor_group", "extractor_input")]
         self.target_slices = self._resolve_slices(obs[target_group].shape[-1], target_slices)
         target_dim = sum(b - a for a, b in self.target_slices.values())
         cond_dim = self.cond_dim_of(obs, kwargs.get("condition_group"), kwargs.get("condition_slices"))
         super().__init__(
             storage=storage,
             actor=actor,
-            predictor_input_dim=encoder.latent_dim + cond_dim,
+            predictor_input_dim=extractor.latent_dim + cond_dim,
             predictor_output_dim=target_dim,
-            feat_group=feat_group,
             **kwargs,
         )
         self.target_group = target_group
@@ -60,7 +59,7 @@ class StateRegAux(AuxObjective):
         self._finalize()
 
     def _obs_keys(self) -> list[str]:
-        keys = [self.feat_group, self.target_group]
+        keys = [self.target_group]
         if self.condition_group is not None and self.condition_group not in keys:
             keys.append(self.condition_group)
         return keys
@@ -68,7 +67,7 @@ class StateRegAux(AuxObjective):
     def _loss(
         self, flat: dict[str, torch.Tensor], actions: torch.Tensor, idx: torch.Tensor, num_envs: int
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        parts = [self.encoder(flat[self.feat_group][idx])]
+        parts = [self._encode(flat, idx)]
         if self.condition_group is not None:
             parts.append(self._cond(flat[self.condition_group][idx], update_stats=True))
         target = self._select_target(flat[self.target_group][idx])

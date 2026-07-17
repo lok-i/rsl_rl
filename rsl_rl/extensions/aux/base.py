@@ -5,7 +5,7 @@
 
 """Base class for auxiliary representation objectives.
 
-An auxiliary objective trains the actor's :class:`~rsl_rl.modules.FeatureEncoder` (plus its own
+An auxiliary objective trains the actor's extractor (plus its own
 predictor head) with a supervised or self-supervised loss, complementary to PPO returns. It is
 invoked by :class:`~rsl_rl.algorithms.PPOAux` — either after the PPO epochs (``sequential``) or
 as an accumulated gradient inside each PPO minibatch (``joint``) — and reads temporally-ordered
@@ -42,7 +42,7 @@ class AuxObjective(nn.Module):
         actor: nn.Module,
         predictor_input_dim: int,
         predictor_output_dim: int,
-        feat_group: str = "img_feat",
+        extractor_group: str = "extractor_input",
         predictor_hidden_dims: tuple[int, ...] | list[int] = (256, 256),
         activation: str = "elu",
         learning_rate: float = 1e-3,
@@ -60,12 +60,12 @@ class AuxObjective(nn.Module):
         K transitions are reset-free, and ``_loss`` may index ``idx + k * num_envs`` for any
         k <= K. K = 0 means no temporal structure (every stored step is a sample).
 
-        ``condition_group``/``condition_slices`` select named column ranges of one observation
-        group as a normalized conditioning input (e.g. the noise-free robot slice of
-        ``aux_state`` — never the object slice, which would bypass the image).
+        ``condition_group`` names the conditioning observation group (default:
+        ``prediction_conditioning`` in the SL variants — robot state only, never object
+        state, which would bypass the image); ``condition_slices`` optionally narrows it.
         """
         super().__init__()
-        self.feat_group = feat_group
+        self.extractor_group = extractor_group
         self.learning_rate = learning_rate
         self.num_epochs = num_epochs
         self.num_mini_batches = num_mini_batches
@@ -83,12 +83,24 @@ class AuxObjective(nn.Module):
         self.predictor = MLP(predictor_input_dim, predictor_output_dim, predictor_hidden_dims, activation)
         # Tuple hides the reference from Module registration: the actor owns the encoder,
         # so it must not appear in this module's state_dict.
-        self._encoder_ref = (actor.encoders[feat_group],)
+        self._extractor_ref = (actor.extractors[extractor_group],)
 
     @property
-    def encoder(self) -> nn.Module:
-        """The actor's feature encoder this objective trains."""
-        return self._encoder_ref[0]
+    def extractor(self) -> nn.Module:
+        """The actor's extractor this objective trains."""
+        return self._extractor_ref[0]
+
+    def _extractor_groups(self) -> tuple[str, ...]:
+        """Observation groups the extractor consumes."""
+        return getattr(self.extractor, "input_groups", None) or (self.extractor_group,)
+
+    def _encode(
+        self, tensors: dict | TensorDict, index: torch.Tensor | tuple, extractor: nn.Module | None = None
+    ) -> torch.Tensor:
+        """Encode rows ``index`` of the extractor's input groups (``tensors``: flat dict or TensorDict)."""
+        enc = self.extractor if extractor is None else extractor
+        groups = getattr(enc, "input_groups", None) or (self.extractor_group,)
+        return enc(*(tensors[g][index] for g in groups))
 
     @staticmethod
     def cond_dim_of(obs: TensorDict, group: str | None, slices: dict[str, tuple[int, int]] | None) -> int:
@@ -106,14 +118,27 @@ class AuxObjective(nn.Module):
         return self.cond_normalizer(cond)
 
     def _finalize(self) -> None:
-        """Build the optimizer over encoder + own trainable parameters. Call last in subclass init."""
-        params = [p for p in chain(self.parameters(), self.encoder.parameters()) if p.requires_grad]
+        """Build the optimizer over extractor + own trainable params; print the architecture. Call last in init."""
+        params = [p for p in chain(self.parameters(), self.extractor.parameters()) if p.requires_grad]
         self.optimizer = torch.optim.Adam(params, lr=self.learning_rate)
+
+        n_own = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        cond = f", cond='{self.condition_group}'({self.cond_dim})" if self.condition_group else ""
+        print(
+            f"Aux Objective: {type(self).__name__} (K={self.unroll_steps}, "
+            f"extractor_group='{self.extractor_group}'{cond}, lr={self.learning_rate:g}, "
+            f"{n_own:,} trainable params — train-only, dropped at deployment)"
+        )
+        for name, mod in self.named_children():
+            if name.startswith("ema_") or isinstance(mod, nn.Identity):
+                continue  # EMA copy = frozen extractor dup (already printed); Identity = noise
+            print(f"  ({name}): " + repr(mod).replace("\n", "\n  "))
 
     # --- sampling ---
 
     def _flat_views(self, storage: RolloutStorage) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-        flat = {g: storage.observations[g].flatten(0, 1) for g in self._obs_keys()}
+        groups = {*self._obs_keys(), *self._extractor_groups()}
+        flat = {g: storage.observations[g].flatten(0, 1) for g in groups}
         return flat, storage.actions.flatten(0, 1)
 
     def _valid_indices(self, storage: RolloutStorage) -> torch.Tensor:
@@ -163,19 +188,21 @@ class AuxObjective(nn.Module):
                     totals[key] = totals.get(key, 0.0) + value
                 num_updates += 1
         out = {key: value / num_updates for key, value in totals.items()}
-        out.update(self.latent_metrics(storage.observations[self.feat_group].flatten(0, 1)))
+        out.update(self.latent_metrics(storage))
         return out
 
     @torch.no_grad()
-    def latent_metrics(self, feats: torch.Tensor, max_samples: int = 4096) -> dict[str, float]:
+    def latent_metrics(self, storage: RolloutStorage, max_samples: int = 4096) -> dict[str, float]:
         """Capacity/collapse diagnostics of the latent z over a rollout sample.
 
         RankMe (Garrido et al. 2023): exp-entropy of the normalized singular-value spectrum —
         the effective number of independent dimensions z actually uses (elbow-plot metric for
         latent_dim ablations). latent_std: mean per-dim std, the cheap collapse alarm.
         """
-        sample = feats[torch.randperm(feats.shape[0], device=feats.device)[:max_samples]]
-        z = self.encoder(sample)
+        flat = {g: storage.observations[g].flatten(0, 1) for g in self._extractor_groups()}
+        num_rows = next(iter(flat.values())).shape[0]
+        idx = torch.randperm(num_rows, device=storage.dones.device)[:max_samples]
+        z = self._encode(flat, idx)
         sv = torch.linalg.svdvals(z.float())
         p = sv / sv.sum() + 1e-12
         rankme = torch.exp(-(p * p.log()).sum())
