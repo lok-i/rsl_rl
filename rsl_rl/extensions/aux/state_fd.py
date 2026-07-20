@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Grounded state-space forward dynamics: SL, K-step autoregression in physical state space."""
+"""Supervised forward dynamics: SL, K-step prediction of a simulator-supervised target."""
 
 from __future__ import annotations
 
@@ -19,23 +19,37 @@ from .base import AuxObjective
 
 
 class StateFdAux(AuxObjective):
-    """Autoregress the physical state over K-step windows: ``(ŝ_k, z_k, cond_k, a_k) -> ŝ_{k+1}``.
+    """Supervised forward dynamics over K-step windows: ``(ŝ_k, z_k, cond_k, a_k) -> ŝ_{k+1}``.
 
-    AnyAdapter's autoregressive world model (OpenTrack ``compute_world_model_loss``,
-    ``world_model_autoregressive=True``), state-for-state: the recursion state is the *physical*
-    state (z is a per-step measurement input); the rollout is chunked into ``unroll_steps``-long
-    windows (reference ``unroll_length=10``), each seeded with the TRUE state at its start,
-    predictions fed back across the window, episode resets handled by masking the loss at done
-    steps and resetting the carry to the true post-reset state (no window masking). Loss is L1
-    on normalized targets (reference: per-slice-weighted L1 — the normalizer plays the weights'
-    role). Minibatches are env columns — the time axis of each window stays whole, one backward
-    through all windows. Deviation from the reference: the encoder reads the real image feature
-    at each step (future images cannot be imagined, unlike their proprio history).
+    The target ``s`` is any simulator-supervised vector (physical object state, current
+    up-face color, task-reward rates — whatever ``prediction_target`` carries), so "state" here
+    means the supervised recursion state, not physical state only. Mechanics follow AnyAdapter's
+    autoregressive world model (OpenTrack ``compute_world_model_loss``): the rollout is chunked
+    into windows of ``unroll_steps`` predictions (reference ``unroll_length=10``), episode
+    resets handled by masking the loss at done steps and resetting the carry to the true
+    post-reset state (no window masking). Loss is L1 on normalized targets (reference:
+    per-slice-weighted L1 — the normalizer plays the weights' role). Minibatches are env
+    columns — the time axis of each window stays whole, one backward through all windows.
+    Deviation from the reference: the encoder reads the real image feature at each step
+    (future images cannot be imagined, unlike their proprio history).
 
-    The true-s seed makes the first window steps nearly image-free (dead reckoning); the
-    later steps are only correctable through z. Keep the target slices to the image-dependent
-    state (object) and condition on the robot slice only (object state in the input would
-    bypass the image).
+    Two switches span the SL family (one predictor, one input layout):
+
+    - ``start_with_current_step``: shift the K window targets from ``{s_{t+1}..s_{t+K}}`` to
+      ``{s_t..s_{t+K-1}}``. The first prediction is then a same-step regression
+      ``(0, z_t, cond_t, 0) -> s_t`` (state/action slots zeroed — no transition is involved),
+      and with ``autoregress`` the chain seeds from that estimate instead of the true state
+      (fully image-grounded window, no dead-reckoning crutch).
+    - ``autoregress``: feed predictions back along the window (default). ``False`` = teacher
+      forcing — every FD step reads the TRUE previous state.
+
+    ``start_with_current_step=True, autoregress=False, unroll_steps=1`` is the dynamics-free
+    decodability probe (the retired StateRegAux, modulo two constant-zero input blocks).
+
+    With the default true-s window seed, the first window steps are nearly image-free (dead
+    reckoning); the later steps are only correctable through z. Keep the target slices to the
+    image-dependent state (object) and condition on the robot slice only (object state in the
+    input would bypass the image).
     """
 
     def __init__(
@@ -44,9 +58,11 @@ class StateFdAux(AuxObjective):
         actor: nn.Module,
         target_group: str = "prediction_target",
         target_slices: dict[str, tuple[int, int]] | None = None,
+        autoregress: bool = True,
+        start_with_current_step: bool = False,
         **kwargs: Any,
     ) -> None:
-        """Initialize the state-FD objective; extra kwargs go to :class:`AuxObjective`."""
+        """Initialize the supervised-FD objective; extra kwargs go to :class:`AuxObjective`."""
         kwargs.setdefault("condition_group", "prediction_conditioning")
         obs: TensorDict = storage.observations
         extractor = actor.extractors[kwargs.get("extractor_group", "extractor_input")]
@@ -65,6 +81,8 @@ class StateFdAux(AuxObjective):
             f"StateFdAux window ({self.unroll_steps}) must fit the rollout "
             f"({storage.num_transitions_per_env} steps)."
         )
+        self.autoregress = autoregress
+        self.start_with_current_step = start_with_current_step
         self.target_group = target_group
         self.target_normalizer = EmpiricalNormalization(target_dim)
         self._finalize()
@@ -122,8 +140,24 @@ class StateFdAux(AuxObjective):
 
         step_losses, errs = [], []
         for start in self._window_starts(num_t):
-            s_hat = target[start]  # seed: TRUE state at the window start (reference behavior)
-            for t in range(start, start + self.unroll_steps):
+            if self.start_with_current_step:
+                # k=0 same-step regression: (0, z_t, cond_t, 0) -> s_t. No transition is
+                # involved (no mask); the chain seed is the estimate iff autoregressive.
+                parts = [torch.zeros_like(target[start]), self._encode(obs, (start, cols))]
+                if cond is not None:
+                    parts.append(cond[start])
+                parts.append(torch.zeros_like(storage.actions[start, cols]))
+                s_hat = self.predictor(torch.cat(parts, dim=-1))
+                err = (s_hat - target[start]).abs()
+                step_losses.append(err.mean())
+                errs.append(err)
+                if not self.autoregress:
+                    s_hat = target[start]
+                fd_steps = self.unroll_steps - 1
+            else:
+                s_hat = target[start]  # seed: TRUE state at the window start (reference behavior)
+                fd_steps = self.unroll_steps
+            for t in range(start, start + fd_steps):
                 parts = [s_hat, self._encode(obs, (t, cols))]
                 if cond is not None:
                     parts.append(cond[t])
@@ -135,15 +169,19 @@ class StateFdAux(AuxObjective):
                 mask = not_done[t]
                 step_losses.append((err.mean(-1) * mask).sum() / mask.sum().clamp(min=1.0))
                 errs.append(err[mask.bool()])
-                s_hat = torch.where(not_done[t].unsqueeze(-1).bool(), s_hat, target[t + 1])
+                if self.autoregress:
+                    s_hat = torch.where(not_done[t].unsqueeze(-1).bool(), s_hat, target[t + 1])
+                else:  # teacher forcing: every step reads the TRUE previous state
+                    s_hat = target[t + 1]
         loss = torch.stack(step_losses).mean()
         metrics = {"loss/fd_l1": loss.item()}
         with torch.no_grad():
-            # Early/late halves WITHIN each window: early rides the true-s seed (dead
+            # Early/late halves WITHIN each window: early rides the window seed (dead
             # reckoning), late is image-corrected only — the image-dependence diagnostic.
-            per_window = torch.stack(step_losses).view(-1, self.unroll_steps)
-            half = self.unroll_steps // 2
-            metrics["fd_l1_early"] = per_window[:, :half].mean().item()
-            metrics["fd_l1_late"] = per_window[:, half:].mean().item()
+            if self.unroll_steps >= 2:
+                per_window = torch.stack(step_losses).view(-1, self.unroll_steps)
+                half = self.unroll_steps // 2
+                metrics["fd_l1_early"] = per_window[:, :half].mean().item()
+                metrics["fd_l1_late"] = per_window[:, half:].mean().item()
             metrics.update(self._slice_metrics(torch.cat(errs, dim=0), "fd_l1_"))
         return loss, metrics
