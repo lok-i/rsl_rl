@@ -8,6 +8,5 @@
 from .base import AuxObjective
 from .latent_fd import LatentFdAux
 from .state_fd import StateFdAux
-from .state_reg import StateRegAux
 
-__all__ = ["AuxObjective", "LatentFdAux", "StateFdAux", "StateRegAux"]
+__all__ = ["AuxObjective", "LatentFdAux", "StateFdAux"]

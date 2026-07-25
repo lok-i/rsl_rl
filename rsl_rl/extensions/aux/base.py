@@ -50,6 +50,7 @@ class AuxObjective(nn.Module):
         num_mini_batches: int = 4,
         max_grad_norm: float = 1.0,
         unroll_steps: int = 1,
+        mini_batch_rows_per_env: float | None = None,
         condition_group: str | None = None,
         condition_slices: dict[str, tuple[int, int]] | None = None,
         device: str = "cpu",
@@ -60,8 +61,13 @@ class AuxObjective(nn.Module):
         K transitions are reset-free, and ``_loss`` may index ``idx + k * num_envs`` for any
         k <= K. K = 0 means no temporal structure (every stored step is a sample).
 
+        ``mini_batch_rows_per_env`` is the aux batch budget in ENCODER-GRADIENT ROWS PER ENV
+        (see :meth:`_sample_count`) — the unit that makes objectives with different sampling
+        units draw the same encoder batch, at any ``num_envs``. ``None`` = the plain
+        ``available // num_mini_batches`` split.
+
         ``condition_group`` names the conditioning observation group (default:
-        ``prediction_conditioning`` in the SL variants — robot state only, never object
+        ``prediction_conditioning`` in the FD variants — robot state only, never object
         state, which would bypass the image); ``condition_slices`` optionally narrows it.
         """
         super().__init__()
@@ -71,6 +77,7 @@ class AuxObjective(nn.Module):
         self.num_mini_batches = num_mini_batches
         self.max_grad_norm = max_grad_norm
         self.unroll_steps = unroll_steps
+        self.mini_batch_rows_per_env = mini_batch_rows_per_env
         self.device = device
         self.condition_group = condition_group
         if condition_group is not None:
@@ -124,9 +131,14 @@ class AuxObjective(nn.Module):
 
         n_own = sum(p.numel() for p in self.parameters() if p.requires_grad)
         cond = f", cond='{self.condition_group}'({self.cond_dim})" if self.condition_group else ""
+        rows = (
+            f", rows/env={self.mini_batch_rows_per_env:g}"
+            if self.mini_batch_rows_per_env is not None
+            else f", mini_batches={self.num_mini_batches}"
+        )
         print(
             f"Aux Objective: {type(self).__name__} (K={self.unroll_steps}, "
-            f"extractor_group='{self.extractor_group}'{cond}, lr={self.learning_rate:g}, "
+            f"extractor_group='{self.extractor_group}'{cond}{rows}, lr={self.learning_rate:g}, "
             f"{n_own:,} trainable params — train-only, dropped at deployment)"
         )
         for name, mod in self.named_children():
@@ -141,6 +153,22 @@ class AuxObjective(nn.Module):
         flat = {g: storage.observations[g].flatten(0, 1) for g in groups}
         return flat, storage.actions.flatten(0, 1)
 
+    def _sample_count(self, rows_per_sample: int, available: int, num_envs: int) -> int:
+        """Resolve the samples per aux call, from the ``mini_batch_rows_per_env`` budget if set.
+
+        Two objectives can sample in different units (env COLUMNS whose whole time axis is
+        scanned, vs flat ``(t, env)`` window starts) yet still owe the shared encoder the same
+        batch. The comparable unit is encoder rows that receive a gradient per aux call:
+        ``rows_per_sample`` (how many the caller's unit costs) x samples. Budgeting it
+        per-env keeps the ask ``num_envs``-agnostic, so an ``-e`` change rescales both
+        objectives identically. ``None`` keeps the plain ``num_mini_batches`` split.
+        """
+        if self.mini_batch_rows_per_env is None:
+            count = available // self.num_mini_batches
+        else:
+            count = int(self.mini_batch_rows_per_env * num_envs) // max(1, rows_per_sample)
+        return min(max(count, 1), available)
+
     def _valid_indices(self, storage: RolloutStorage) -> torch.Tensor:
         """Flat (t, n) start indices whose K-step window is reset-free (all steps if K = 0)."""
         num_t, num_envs = storage.num_transitions_per_env, storage.num_envs
@@ -154,7 +182,8 @@ class AuxObjective(nn.Module):
         """One freshly-sampled minibatch loss (joint mode); caller does backward + step."""
         flat, actions = self._flat_views(storage)
         indices = self._valid_indices(storage)
-        mini_batch_size = len(indices) // self.num_mini_batches
+        # one encoder pass per unrolled step -> K rows per sampled window start
+        mini_batch_size = self._sample_count(max(1, self.unroll_steps), len(indices), storage.num_envs)
         if mini_batch_size == 0:
             return None
         idx = indices[torch.randint(len(indices), (mini_batch_size,), device=indices.device)]

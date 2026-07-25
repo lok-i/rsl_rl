@@ -5,7 +5,7 @@
 
 """Extensions for the learning algorithms."""
 
-from .aux import AuxObjective, LatentFdAux, StateFdAux, StateRegAux
+from .aux import AuxObjective, LatentFdAux, StateFdAux
 from .rnd import RandomNetworkDistillation, resolve_rnd_config
 from .symmetry import Symmetry, resolve_symmetry_config
 
@@ -14,7 +14,6 @@ __all__ = [
     "LatentFdAux",
     "RandomNetworkDistillation",
     "StateFdAux",
-    "StateRegAux",
     "Symmetry",
     "resolve_rnd_config",
     "resolve_symmetry_config",
