@@ -13,14 +13,17 @@ quantizer would be snapped away by the rounding until it crosses half a grid ste
 
 from __future__ import annotations
 
+import copy
 import torch
+import torch.nn as nn
 from tensordict import TensorDict
 from typing import Any
 
 from rsl_rl.modules import MLPWithAdapter
 
+from ._onnx_export import Port, merge_adapters
 from .mlp_adapter_model import AdapterStreamMixin
-from .sonic_base_model import SonicBaseModel
+from .sonic_base_model import SonicBaseModel, _OnnxSonicBaseModel
 
 
 class SonicWithAdapterModel(AdapterStreamMixin, SonicBaseModel):
@@ -63,3 +66,27 @@ class SonicWithAdapterModel(AdapterStreamMixin, SonicBaseModel):
         """Adapted decoder pass, conditioned on the adapter stream."""
         base_input = torch.cat([tokens, self._get_proprio(obs)], dim=-1)
         return self.decoder(base_input, self._get_adapter_latent(obs))
+
+    def as_onnx(self, verbose: bool = False) -> nn.Module:
+        """Return a multi-input ONNX wrapper (base ports + the adapter stream)."""
+        return _OnnxSonicAdapterModel(self, verbose)
+
+
+class _OnnxSonicAdapterModel(_OnnxSonicBaseModel):
+    """Exportable SONIC + LoRA: the base graph with the adapters folded into the decoder.
+
+    The adapter stream contributes one input per group and its normalizer; the LoRA weights
+    live in the merged decoder (see :func:`~rsl_rl.models._onnx_export.merge_adapters`), so
+    the exported graph has no adapter branch at all.
+    """
+
+    def _merge_decoder(self, model: SonicWithAdapterModel) -> nn.Sequential:  # type: ignore[override]
+        merged, _ = merge_adapters(model.decoder)
+        return merged
+
+    def _adapter_ports(self, model: SonicWithAdapterModel) -> list[Port]:  # type: ignore[override]
+        self.adapter_normalizer = copy.deepcopy(model.adapter_normalizer)
+        return [Port(g, model.export_shapes[g], (g,)) for g in model.adapter_obs_groups]
+
+    def _adapter_latent(self, inputs: list[torch.Tensor]) -> torch.Tensor:
+        return self.adapter_normalizer(torch.cat(inputs, dim=-1))

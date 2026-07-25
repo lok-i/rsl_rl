@@ -11,17 +11,19 @@ trains them (if any) is decided by the algorithm (see ``rsl_rl.algorithms.PPOAux
 
 from __future__ import annotations
 
+import copy
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
 from typing import Any
 
-from rsl_rl.modules import EmpiricalNormalization, HiddenState
+from rsl_rl.modules import CrossAttentionExtractor, EmpiricalNormalization, HiddenState
 from rsl_rl.utils import resolve_callable
 
+from ._onnx_export import Port
 from .mlp_adapter_model import ModularNormMLPWithAdapterModel
 from .mlp_model import MLPModel
-from .sonic_adapter_model import SonicWithAdapterModel
+from .sonic_adapter_model import SonicWithAdapterModel, _OnnxSonicAdapterModel
 
 
 def _build_extractors(obs: TensorDict, extractor_cfg: dict[str, dict] | None, extractors: dict | None) -> dict:
@@ -241,3 +243,161 @@ class ExtractorAdapterModel(ExtractedAdapterStreamMixin, ModularNormMLPWithAdapt
 
 class ExtractorSonicAdapterModel(ExtractedAdapterStreamMixin, SonicWithAdapterModel):
     """A :class:`SonicWithAdapterModel` whose adapter stream is extractor-fed."""
+
+    def as_onnx(self, verbose: bool = False, with_attn: bool = True) -> nn.Module:
+        """Return a multi-input ONNX wrapper (base ports + extractor token/query ports).
+
+        ``with_attn`` adds the attention map as a second output — already computed, so it is
+        free, and it is what a deploy-side "where is it looking" overlay reads.
+        """
+        return _OnnxExtractorSonicAdapterModel(self, verbose, with_attn=with_attn)
+
+
+# ---------------------------------------------------------------------------
+# ONNX export
+# ---------------------------------------------------------------------------
+
+
+class _OnnxCrossAttention(nn.Module):
+    """Export copy of :class:`~rsl_rl.modules.CrossAttentionExtractor`.
+
+    Same math, but token/query groups arrive as positional tensors (ONNX has no dict inputs)
+    and the module-level debug tap is dropped — the attention map leaves as a return value
+    instead of a side effect.
+    """
+
+    def __init__(self, extractor: CrossAttentionExtractor) -> None:
+        """Deep-copy the trained weights and normalizers into a trace-friendly layout."""
+        super().__init__()
+        self.token_normalizers = nn.ModuleList(
+            copy.deepcopy(extractor.token_normalizers[t]) for t in extractor.token_terms
+        )
+        self.query_normalizers = nn.ModuleList(
+            copy.deepcopy(extractor.query_normalizers[g]) for g in extractor.query_groups
+        )
+        self.w_q = nn.ModuleList(copy.deepcopy(extractor.w_q[g]) for g in extractor.query_groups)
+        self.w_k = copy.deepcopy(extractor.w_k)
+        self.w_v = copy.deepcopy(extractor.w_v)
+        self.learned_queries = (
+            None
+            if extractor.learned_queries is None
+            else nn.Parameter(extractor.learned_queries.detach().clone())
+        )
+        self.proj = copy.deepcopy(extractor.proj)
+        self.out_norm = copy.deepcopy(extractor.out_norm)
+        self.attn_scale = extractor.attn_dim**0.5
+        self.num_token_inputs = len(extractor.token_terms)
+
+    def forward(self, *inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pool the token inputs under every query row; returns ``(latent, attention)``."""
+        token_inputs = inputs[: self.num_token_inputs]
+        query_inputs = inputs[self.num_token_inputs :]
+        tokens = torch.cat(
+            [norm(x) for norm, x in zip(self.token_normalizers, token_inputs)], dim=1
+        )
+        keys, values = self.w_k(tokens), self.w_v(tokens)
+        rows = [
+            w_q(norm(qv)).unsqueeze(1)
+            for w_q, norm, qv in zip(self.w_q, self.query_normalizers, query_inputs)
+        ]
+        q = torch.cat(rows, dim=1)
+        if self.learned_queries is not None:
+            q = torch.cat(
+                [q, self.learned_queries.unsqueeze(0).expand(tokens.shape[0], -1, -1)], dim=1
+            )
+        attn = torch.softmax(q @ keys.transpose(-2, -1) / self.attn_scale, dim=-1)
+        return self.out_norm(self.proj((attn @ values).flatten(1))), attn
+
+
+class _OnnxFlatExtractor(nn.Module):
+    """Export copy of a single-flat-group extractor (e.g. :class:`MlpExtractor`)."""
+
+    def __init__(self, extractor: nn.Module) -> None:
+        """Deep-copy the extractor; the tuple return keeps the caller uniform."""
+        super().__init__()
+        self.extractor = copy.deepcopy(extractor)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
+        """Project the feature group to its latent (no attention map)."""
+        return self.extractor(x), None
+
+
+def _wrap_extractor(extractor: nn.Module, group: str, shapes: dict) -> tuple[nn.Module, list[Port]]:
+    """Build the export copy of one extractor plus the ONNX ports feeding it.
+
+    Ports follow ``extractor.input_groups``: the dict token group expands to one input per
+    term (``<group>__<term>``, in the extractor's own ``token_terms`` order — never sorted-key
+    luck), each query group is one flat input.
+    """
+    if isinstance(extractor, CrossAttentionExtractor):
+        ports = [
+            Port(f"{group}__{term}", shapes[group][term], (group,), term=term)
+            for term in extractor.token_terms
+        ]
+        ports += [Port(g, shapes[g], (g,)) for g in extractor.query_groups]
+        return _OnnxCrossAttention(extractor), ports
+    if getattr(extractor, "term_keys", None) is None and not isinstance(shapes[group], dict):
+        return _OnnxFlatExtractor(extractor), [Port(group, shapes[group], (group,))]
+    raise NotImplementedError(
+        f"ONNX export for extractor {type(extractor).__name__} on a dict group is not implemented."
+    )
+
+
+class _OnnxExtractorSonicAdapterModel(_OnnxSonicAdapterModel):
+    """Exportable SONIC + LoRA whose adapter latent is ``[normalized plain groups | z]``.
+
+    The extractor lives inside the graph (its normalizers included); only the frozen vision
+    backbone stays outside — deployment streams its tokens in on the ``kv_tokens__*`` ports.
+    """
+
+    def __init__(self, model: ExtractorSonicAdapterModel, verbose: bool = False,
+                 with_attn: bool = True) -> None:
+        """Build the export copy; ``with_attn`` exposes the attention map as an extra output."""
+        self.with_attn = with_attn
+        super().__init__(model, verbose)
+
+    def _adapter_ports(self, model: ExtractorSonicAdapterModel) -> list[Port]:  # type: ignore[override]
+        self.adapter_normalizer = copy.deepcopy(model.adapter_normalizer)
+        self.num_plain_inputs = len(model.plain_adapter_groups)
+        ports = [Port(g, model.export_shapes[g], (g,)) for g in model.plain_adapter_groups]
+        self.extractors = nn.ModuleList()
+        self.extractor_input_counts: list[int] = []
+        for group in model.extracted_adapter_groups:
+            wrapper, extractor_ports = _wrap_extractor(
+                model.extractors[group], group, model.export_shapes
+            )
+            self.extractors.append(wrapper)
+            self.extractor_input_counts.append(len(extractor_ports))
+            ports += extractor_ports
+        self.num_attn_outputs = sum(
+            isinstance(e, _OnnxCrossAttention) for e in self.extractors
+        )
+        self.with_attn = self.with_attn and self.num_attn_outputs > 0
+        return ports
+
+    def _adapter_latent(self, inputs: list[torch.Tensor]) -> torch.Tensor:
+        # Order matches ExtractedAdapterStreamMixin._get_adapter_latent: plain groups first.
+        parts, attentions = [], []
+        if self.num_plain_inputs:
+            plain = torch.cat(inputs[: self.num_plain_inputs], dim=-1)
+            parts.append(self.adapter_normalizer(plain))
+        offset = self.num_plain_inputs
+        for extractor, count in zip(self.extractors, self.extractor_input_counts):
+            latent, attn = extractor(*inputs[offset : offset + count])
+            offset += count
+            parts.append(latent)
+            if attn is not None:
+                attentions.append(attn)
+        self._attentions = attentions
+        return torch.cat(parts, dim=-1)
+
+    def _extra_outputs(self) -> list[torch.Tensor]:
+        return self._attentions if self.with_attn else []
+
+    @property
+    def output_names(self) -> list[str]:
+        """ONNX output names (one ``attn_*`` per attention-producing extractor)."""
+        names = ["actions"]
+        if self.with_attn:
+            names += [f"attn_{i}" if i else "attn" for i in range(self.num_attn_outputs)]
+        return names

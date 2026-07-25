@@ -20,6 +20,7 @@ Token flow::
 
 from __future__ import annotations
 
+import copy
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
@@ -27,6 +28,14 @@ from tensordict import TensorDict
 from rsl_rl.modules import HiddenState
 from rsl_rl.modules.distribution import Distribution
 from rsl_rl.utils import resolve_callable, unpad_trajectories
+
+from ._onnx_export import (
+    FoldedFSQ,
+    Port,
+    _OnnxExportBase,
+    capture_obs_shapes,
+    plain_mlp_copy,
+)
 
 
 def fsq_quantize(z: torch.Tensor, levels: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
@@ -103,6 +112,8 @@ class SonicBaseModel(nn.Module):
         # Resolve stream dims from the observation dict.
         self.obs_groups = obs_groups[obs_set]
         self.tokenizer_obs_group = tokenizer_obs_group
+        # Per-group obs shapes, kept for ONNX export (ports sized without a live env).
+        self.export_shapes = capture_obs_shapes(obs)
         proprio_dim = sum(obs[g].shape[-1] for g in self.obs_groups)
         tokenizer_dim = obs[tokenizer_obs_group].shape[-1]
 
@@ -252,6 +263,73 @@ class SonicBaseModel(nn.Module):
         """JIT export (not implemented)."""
         raise NotImplementedError("JIT export for SonicBaseModel is not implemented yet.")
 
-    def as_onnx(self, verbose: bool) -> nn.Module:
-        """ONNX export (not implemented)."""
-        raise NotImplementedError("ONNX export for SonicBaseModel is not implemented yet.")
+    def as_onnx(self, verbose: bool = False) -> nn.Module:
+        """Return a multi-input ONNX wrapper (one input per observation group)."""
+        return _OnnxSonicBaseModel(self, verbose)
+
+
+class _OnnxSonicBaseModel(_OnnxExportBase):
+    """Exportable SONIC base: tokenizer -> encoder -> FSQ -> decoder -> action.
+
+    Inputs are ``(tokenizer, *obs_groups, *adapter_stream)``; the adapter tail is empty here
+    and supplied by subclasses through :meth:`_adapter_ports` / :meth:`_adapter_latent`, so
+    the decoder path is written once for the whole SONIC family (the adapted decoder is a
+    plain MLP after :func:`~rsl_rl.models._onnx_export.merge_adapters`).
+    """
+
+    def __init__(self, model: SonicBaseModel, verbose: bool = False) -> None:
+        """Build the export copy: deep-copied encoder, folded FSQ, merged decoder."""
+        super().__init__(verbose)
+        self.encoder = copy.deepcopy(model.encoder)
+        self.fsq = FoldedFSQ(model.fsq_levels)
+        self.num_tokens = model.num_tokens
+        self.token_dim = model.token_dim
+        self.decoder = self._merge_decoder(model)
+        self.deterministic_output = (
+            model.distribution.as_deterministic_output_module()
+            if model.distribution is not None
+            else nn.Identity()
+        )
+
+        shapes = model.export_shapes
+        base_slots = [
+            Port(model.tokenizer_obs_group, shapes[model.tokenizer_obs_group],
+                 (model.tokenizer_obs_group,)),
+            *(Port(g, shapes[g], (g,)) for g in model.obs_groups),
+        ]
+        self.num_base_inputs = len(base_slots)
+        self._set_slots(base_slots + self._adapter_ports(model))
+
+    # --- hooks (overridden by the adapter / extractor variants) ---
+
+    def _merge_decoder(self, model: SonicBaseModel) -> nn.Sequential:
+        """Return the plain (un-adapted) decoder."""
+        return plain_mlp_copy(model.decoder)
+
+    def _adapter_ports(self, model: SonicBaseModel) -> list[Port]:
+        """Extra inputs feeding the adapter latent (none for the plain base)."""
+        return []
+
+    def _adapter_latent(self, inputs: list[torch.Tensor]) -> torch.Tensor | None:
+        """Return the adapter latent appended to the decoder input (``None`` for the base)."""
+        return None
+
+    def _extra_outputs(self) -> list[torch.Tensor]:
+        """Return diagnostic outputs produced while building the adapter latent (none here)."""
+        return []
+
+    # --- forward ---
+
+    def forward(self, *inputs: torch.Tensor) -> torch.Tensor:
+        """Deterministic action for one observation, inputs in ``input_names`` order."""
+        slots = self._gather(inputs)
+        latent = self.encoder(slots[0])
+        latent = latent.reshape(latent.shape[0], self.num_tokens, self.token_dim)
+        tokens = self.fsq(latent).reshape(latent.shape[0], self.num_tokens * self.token_dim)
+        parts = [tokens, *slots[1:self.num_base_inputs]]
+        adapter_latent = self._adapter_latent(slots[self.num_base_inputs:])
+        if adapter_latent is not None:
+            parts.append(adapter_latent)
+        actions = self.deterministic_output(self.decoder(torch.cat(parts, dim=-1)))
+        extras = self._extra_outputs()
+        return (actions, *extras) if extras else actions
