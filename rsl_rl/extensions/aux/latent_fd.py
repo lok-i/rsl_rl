@@ -29,6 +29,13 @@ class LatentFdAux(AuxObjective):
     is predictable under the agent's own actions. The EMA target is anti-collapse plumbing,
     not grounding.
 
+    The transition is also conditioned on ``condition_group`` (robot state r, default on — the
+    reference encoder ingests proprio directly, ours reaches it only as an attention QUERY whose
+    value never enters z). Two things this buys: input parity with :class:`StateFdAux`, whose
+    predictor reads the same r, and no reward for re-encoding proprio into z — the easy,
+    already-available modality — leaving object content as z's only contribution. As in the SL
+    variant, step k reads the TRUE ``r_{t+k}``, so the chain is open-loop in z alone.
+
     Loss composition (``autoregressive=True``): ``L = (Σ_k L_TF^k + Σ_{k>1} L_AR^k) / (2K-1)``
     — the teacher-forced sum is the reference loss verbatim (fresh-encoded true ``z_k`` each
     step: K encoder gradient paths per window), and the open-loop chain (prediction fed back
@@ -50,8 +57,10 @@ class LatentFdAux(AuxObjective):
         """Initialize the latent objective; extra kwargs go to :class:`AuxObjective`.
 
         The base predictor is the projector (reference: Linear-ELU-Linear, set
-        ``predictor_hidden_dims`` accordingly at the call site).
+        ``predictor_hidden_dims`` accordingly at the call site). Conditioning enters the
+        transition only — the projector stays z -> z (BYOL-side plumbing).
         """
+        kwargs.setdefault("condition_group", "prediction_conditioning")
         extractor = actor.extractors[kwargs.get("extractor_group", "extractor_input")]
         action_dim = storage.actions.shape[-1]
         kwargs.setdefault("predictor_hidden_dims", (extractor.latent_dim,))
@@ -67,18 +76,22 @@ class LatentFdAux(AuxObjective):
         self.autoregressive = autoregressive
         activation = kwargs.get("activation", "elu")
         self.transition = MLP(
-            extractor.latent_dim + action_dim, extractor.latent_dim, transition_hidden_dims, activation
+            extractor.latent_dim + action_dim + self.cond_dim,
+            extractor.latent_dim,
+            transition_hidden_dims,
+            activation,
         )
         self.ema_extractor = copy.deepcopy(extractor)
         self.ema_extractor.requires_grad_(False)
         self._finalize()
 
     def _obs_keys(self) -> list[str]:
-        return []
+        return [self.condition_group] if self.condition_group is not None else []
 
-    def _step(self, z: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+    def _step(self, z: torch.Tensor, action: torch.Tensor, cond: torch.Tensor | None) -> torch.Tensor:
         """Residual transition (reference DynamicsMLP predicts the state difference)."""
-        return z + self.transition(torch.cat([z, action], dim=-1))
+        parts = [z, action] if cond is None else [z, action, cond]
+        return z + self.transition(torch.cat(parts, dim=-1))
 
     def _loss(
         self, flat: dict[str, torch.Tensor], actions: torch.Tensor, idx: torch.Tensor, num_envs: int
@@ -90,19 +103,21 @@ class LatentFdAux(AuxObjective):
             tgt_prev = self._encode(flat, idx, extractor=self.ema_extractor)
             tgt_next = self._encode(flat, idx + num_envs, extractor=self.ema_extractor)
             metrics["latent_floor"] = functional.mse_loss(tgt_prev, tgt_next).item()
-        z_ar = None
+        z_ar, cond = None, None
         for k in range(self.unroll_steps):
             action = actions[idx + k * num_envs]
+            if self.condition_group is not None:  # TRUE r_{t+k}, both branches (SL-variant parity)
+                cond = self._cond(flat[self.condition_group][idx + k * num_envs], update_stats=(k == 0))
             with torch.no_grad():
                 target = (
                     self._encode(flat, idx + (k + 1) * num_envs, extractor=self.ema_extractor) if k > 0 else tgt_next
                 )
             # TF branch (reference-exact): fresh-encoded true z_k, 1-step prediction.
             z_tf = self._encode(flat, idx + k * num_envs)
-            losses_tf.append(functional.mse_loss(self.predictor(self._step(z_tf, action)), target))
+            losses_tf.append(functional.mse_loss(self.predictor(self._step(z_tf, action, cond)), target))
             # AR branch (deviation): open-loop chain from z_0, multi-step consistency.
             if self.autoregressive:
-                z_ar = self._step(z_tf if k == 0 else z_ar, action)
+                z_ar = self._step(z_tf if k == 0 else z_ar, action, cond)
                 if k > 0:  # k = 0 is identical to the TF term — count it once
                     losses_ar.append(functional.mse_loss(self.predictor(z_ar), target))
         loss = torch.stack(losses_tf + losses_ar).mean()

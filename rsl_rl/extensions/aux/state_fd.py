@@ -83,6 +83,8 @@ class StateFdAux(AuxObjective):
         )
         self.autoregress = autoregress
         self.start_with_current_step = start_with_current_step
+        # every window contributes K predictions -> K encoder rows per sampled env column
+        self._rows_per_col = len(self._window_starts(storage.num_transitions_per_env)) * self.unroll_steps
         self.target_group = target_group
         self.target_normalizer = EmpiricalNormalization(target_dim)
         self._finalize()
@@ -99,7 +101,7 @@ class StateFdAux(AuxObjective):
 
     def sample_loss(self, storage: RolloutStorage) -> tuple[torch.Tensor, dict[str, float]] | None:
         """One env-column minibatch over all windows (joint mode)."""
-        mini_batch_size = storage.num_envs // self.num_mini_batches
+        mini_batch_size = self._sample_count(self._rows_per_col, storage.num_envs, storage.num_envs)
         if mini_batch_size == 0:
             return None
         cols = torch.randint(storage.num_envs, (mini_batch_size,), device=storage.dones.device)

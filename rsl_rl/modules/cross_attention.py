@@ -28,13 +28,13 @@ class CrossAttentionExtractor(nn.Module):
     (``K = f W_k``, ``V = f W_v``); ``z = LayerNorm(proj(flatten(softmax(Q K^T/sqrt(d)) V)))``.
     Query VALUES are not carried into z (pure attention pooling) — the sys0 hierarchy routes
     command values to control directly (adapter stream), the query only steers *where to look*
-    (docs/extractor_ahead.md). Token count P is free at runtime (resolution-agnostic).
+    (docs/vision_stack.md). Token count P is free at runtime (resolution-agnostic).
 
     Consumes ONE dict token group (``concatenate_terms=False``, roles EXPLICIT via
     ``token_terms``) + N vector query groups (``concatenate_terms=True``, one row each).
     ``input_groups = (token_group, *query_groups)`` — the host gathers them positionally.
 
-    ``num_heads`` is reserved for the multi-head extension (docs/extractor_ahead.md step 1);
+    ``num_heads`` is reserved for the multi-head extension (docs/vision_stack.md step 1);
     only ``num_heads=1`` is implemented today.
     """
 
@@ -53,7 +53,7 @@ class CrossAttentionExtractor(nn.Module):
     ) -> None:
         """Initialize from the token channel dim and the per-query-group source dims."""
         super().__init__()
-        assert num_heads == 1, "multi-head is step-1 (docs/extractor_ahead.md); single-head only"
+        assert num_heads == 1, "multi-head is step-1 (docs/vision_stack.md); single-head only"
         assert query_groups or num_learned_queries > 0, "need a query group and/or learned queries"
         self.token_dim = token_dim
         self.latent_dim = latent_dim
