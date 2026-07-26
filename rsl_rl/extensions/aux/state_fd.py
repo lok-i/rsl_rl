@@ -140,19 +140,28 @@ class StateFdAux(AuxObjective):
         cond = self._cond(obs[self.condition_group][:, cols], update_stats=True) if self.condition_group else None
         not_done = 1.0 - storage.dones.squeeze(-1)[:, cols].float()  # (T, mb)
 
-        step_losses, errs = [], []
-        for start in self._window_starts(num_t):
+        # Every encode in a window reads STORED observations — only s_hat is sequential.
+        # So the extractor runs once over the whole (windows x K x mb) block instead of
+        # once per step: same math (it is row-independent), ~K-fold fewer kernel launches,
+        # and GEMM shapes K times larger. Activations were already all live in one
+        # backward graph, so peak memory is unchanged.
+        starts = self._window_starts(num_t)
+        z = self._encode_span(obs, starts, cols)
+
+        step_losses, err_sums, err_counts = [], [], []
+        for w, start in enumerate(starts):
             if self.start_with_current_step:
                 # k=0 same-step regression: (0, z_t, cond_t, 0) -> s_t. No transition is
                 # involved (no mask); the chain seed is the estimate iff autoregressive.
-                parts = [torch.zeros_like(target[start]), self._encode(obs, (start, cols))]
+                parts = [torch.zeros_like(target[start]), z[w, 0]]
                 if cond is not None:
                     parts.append(cond[start])
                 parts.append(torch.zeros_like(storage.actions[start, cols]))
                 s_hat = self.predictor(torch.cat(parts, dim=-1))
                 err = (s_hat - target[start]).abs()
                 step_losses.append(err.mean())
-                errs.append(err)
+                err_sums.append(err.sum(0))
+                err_counts.append(not_done.new_tensor(float(err.shape[0])))
                 if not self.autoregress:
                     s_hat = target[start]
                 fd_steps = self.unroll_steps - 1
@@ -160,7 +169,7 @@ class StateFdAux(AuxObjective):
                 s_hat = target[start]  # seed: TRUE state at the window start (reference behavior)
                 fd_steps = self.unroll_steps
             for t in range(start, start + fd_steps):
-                parts = [s_hat, self._encode(obs, (t, cols))]
+                parts = [s_hat, z[w, t - start]]
                 if cond is not None:
                     parts.append(cond[t])
                 parts.append(storage.actions[t, cols])
@@ -170,7 +179,12 @@ class StateFdAux(AuxObjective):
                 err = (s_hat - target[t + 1]).abs()
                 mask = not_done[t]
                 step_losses.append((err.mean(-1) * mask).sum() / mask.sum().clamp(min=1.0))
-                errs.append(err[mask.bool()])
+                # Masked SUM + count, never `err[mask.bool()]`: a boolean index has a
+                # data-dependent output shape, so it forces a device->host sync on every
+                # step of every window of every minibatch — hundreds per update, purely to
+                # feed a diagnostic. Sum/count stays on device and divides out identically.
+                err_sums.append((err * mask.unsqueeze(-1)).sum(0))
+                err_counts.append(mask.sum())
                 if self.autoregress:
                     s_hat = torch.where(not_done[t].unsqueeze(-1).bool(), s_hat, target[t + 1])
                 else:  # teacher forcing: every step reads the TRUE previous state
@@ -185,5 +199,19 @@ class StateFdAux(AuxObjective):
                 half = self.unroll_steps // 2
                 metrics["fd_l1_early"] = per_window[:, :half].mean().item()
                 metrics["fd_l1_late"] = per_window[:, half:].mean().item()
-            metrics.update(self._slice_metrics(torch.cat(errs, dim=0), "fd_l1_"))
+            # Row-weighted per-dim mean == the old concat-then-mean (every step contributes
+            # its own row count), so the logged slices are unchanged.
+            per_dim = torch.stack(err_sums).sum(0) / torch.stack(err_counts).sum().clamp(min=1.0)
+            metrics.update(self._slice_metrics(per_dim, "fd_l1_"))
         return loss, metrics
+
+    def _encode_span(self, obs: dict, starts: range, cols: torch.Tensor) -> torch.Tensor:
+        """Encode every window's K steps in ONE extractor pass -> ``(windows, K, mb, latent)``.
+
+        Advanced indexing pairs the two index tensors elementwise, so the flat row order is
+        (window, step, column) — exactly the view the caller unflattens to.
+        """
+        k, mb = self.unroll_steps, len(cols)
+        steps = torch.cat([torch.arange(s, s + k, device=cols.device) for s in starts])
+        z = self._encode(obs, (steps.repeat_interleave(mb), cols.repeat(len(steps))))
+        return z.view(len(starts), k, mb, -1)

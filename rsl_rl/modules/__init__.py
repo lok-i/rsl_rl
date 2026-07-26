@@ -5,6 +5,7 @@
 
 """Building blocks for neural models."""
 
+from .amp import AmpMixin, resolve_amp_dtype, set_model_amp
 from .cnn import CNN
 from .cross_attention import CrossAttentionExtractor
 from .distribution import BetaDistribution, Distribution, GaussianDistribution, HeteroscedasticGaussianDistribution
@@ -21,6 +22,7 @@ __all__ = [
     "MLP",
     "RNN",
     "Adapter",
+    "AmpMixin",
     "BetaDistribution",
     "CrossAttentionExtractor",
     "Distribution",
@@ -36,4 +38,6 @@ __all__ = [
     "ModularNormMLPWithAdapter",
     "ModularNormMLPWithSidecar",
     "Sidecar",
+    "resolve_amp_dtype",
+    "set_model_amp",
 ]

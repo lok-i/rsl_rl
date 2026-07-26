@@ -97,23 +97,23 @@ class LatentFdAux(AuxObjective):
         self, flat: dict[str, torch.Tensor], actions: torch.Tensor, idx: torch.Tensor, num_envs: int
     ) -> tuple[torch.Tensor, dict[str, float]]:
         losses_tf, losses_ar, metrics = [], [], {}
+        # Both encoder streams read STORED rows at fixed offsets — nothing here depends on the
+        # AR recursion, so each runs ONCE over its whole (steps x mb) block instead of once per
+        # step (see StateFdAux._encode_span for the same argument).
+        z_live = self._encode_span(flat, idx, num_envs, self.unroll_steps)
         with torch.no_grad():
+            z_tgt = self._encode_span(flat, idx, num_envs, self.unroll_steps + 1, self.ema_extractor)
             # Do-nothing floor: distance between consecutive targets. A learned loss that only
             # matches this is exploiting temporal smoothness, not dynamics.
-            tgt_prev = self._encode(flat, idx, extractor=self.ema_extractor)
-            tgt_next = self._encode(flat, idx + num_envs, extractor=self.ema_extractor)
-            metrics["latent_floor"] = functional.mse_loss(tgt_prev, tgt_next).item()
+            metrics["latent_floor"] = functional.mse_loss(z_tgt[0], z_tgt[1]).item()
         z_ar, cond = None, None
         for k in range(self.unroll_steps):
             action = actions[idx + k * num_envs]
             if self.condition_group is not None:  # TRUE r_{t+k}, both branches (SL-variant parity)
                 cond = self._cond(flat[self.condition_group][idx + k * num_envs], update_stats=(k == 0))
-            with torch.no_grad():
-                target = (
-                    self._encode(flat, idx + (k + 1) * num_envs, extractor=self.ema_extractor) if k > 0 else tgt_next
-                )
+            target = z_tgt[k + 1]
             # TF branch (reference-exact): fresh-encoded true z_k, 1-step prediction.
-            z_tf = self._encode(flat, idx + k * num_envs)
+            z_tf = z_live[k]
             losses_tf.append(functional.mse_loss(self.predictor(self._step(z_tf, action, cond)), target))
             # AR branch (deviation): open-loop chain from z_0, multi-step consistency.
             if self.autoregressive:
@@ -126,6 +126,18 @@ class LatentFdAux(AuxObjective):
         if losses_ar:
             metrics["latent_ar_mse"] = torch.stack(losses_ar).mean().item()
         return loss, metrics
+
+    def _encode_span(
+        self, flat: dict[str, torch.Tensor], idx: torch.Tensor, num_envs: int,
+        steps: int, extractor: nn.Module | None = None,
+    ) -> torch.Tensor:
+        """Encode ``steps`` consecutive offsets of ``idx`` in one pass -> ``(steps, mb, latent)``.
+
+        ``flat`` is the (t, env)-flattened storage, so step k of window start ``i`` is the row
+        ``i + k * num_envs``; concatenating the offsets keeps the block order (step, sample).
+        """
+        rows = torch.cat([idx + k * num_envs for k in range(steps)])
+        return self._encode(flat, rows, extractor=extractor).view(steps, len(idx), -1)
 
     def _post_step(self) -> None:
         with torch.no_grad():

@@ -25,9 +25,13 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
-from rsl_rl.modules import HiddenState
+from rsl_rl.modules import AmpMixin, HiddenState
 from rsl_rl.modules.distribution import Distribution
 from rsl_rl.utils import resolve_callable, unpad_trajectories
+
+TOKEN_CACHE_KEY = "_sonic_tokens"
+"""Observation key carrying pre-quantized tokens through the rollout storage (see
+:meth:`SonicBaseModel.storage_obs`)."""
 
 from ._onnx_export import (
     FoldedFSQ,
@@ -73,7 +77,7 @@ def _mlp(
     return nn.Sequential(*layers)
 
 
-class SonicBaseModel(nn.Module):
+class SonicBaseModel(AmpMixin, nn.Module):
     """Frozen SONIC base policy (single encoder mode).
 
     Two observation streams:
@@ -85,6 +89,27 @@ class SonicBaseModel(nn.Module):
 
     ``latent_residual`` (post-quantization additive correction in token space)
     is the native adaptation hook; trainable heads strap onto it in phase 2.
+
+    **Which half is frozen decides what a PPO update may skip.** An update runs
+    ``num_learning_epochs x num_mini_batches`` forward/backward passes over one
+    rollout; any sub-graph whose inputs AND weights are fixed for the whole update
+    produces the same numbers every pass. Three branches, selected by
+    ``freeze_encoder`` / ``freeze_decoder`` (both default to ``freeze_base``):
+
+    ==================================  ====================================================
+    branch                              invariant across the update
+    ==================================  ====================================================
+    ``freeze_encoder`` (fine-tune dec)  encoder + FSQ -> tokens; cached via
+                                        :meth:`storage_obs`, ~15% of the actor's update cost
+    ``freeze_decoder`` (fine-tune enc)  nothing in the token path (the encoder trains);
+                                        the frozen decoder's backward is grad-input only,
+                                        which autograd already does for ``requires_grad=False``
+    neither                             nothing; the naive full fine-tune
+    ==================================  ====================================================
+
+    The token cache is bit-exact by construction: a frozen encoder over a fixed
+    ``tokenizer`` row is a pure function, so the 20 recomputations it replaces were
+    already producing identical values.
     """
 
     is_recurrent: bool = False
@@ -105,8 +130,19 @@ class SonicBaseModel(nn.Module):
         distribution_cfg: dict | None = None,
         base_checkpoint: str | None = None,
         freeze_base: bool = True,
+        freeze_encoder: bool | None = None,
+        freeze_decoder: bool | None = None,
+        cache_tokens: bool = True,
     ) -> None:
-        """Build the encoder/FSQ/decoder stack; dims inferred from ``obs``."""
+        """Build the encoder/FSQ/decoder stack; dims inferred from ``obs``.
+
+        Args:
+            freeze_base: Coarse default for both halves (kept for backward compatibility).
+            freeze_encoder: Freeze the tokenizer encoder. ``None`` inherits ``freeze_base``.
+            freeze_decoder: Freeze the action decoder. ``None`` inherits ``freeze_base``.
+            cache_tokens: Route tokens through the rollout storage when the encoder is
+                frozen, so the update never re-runs it. Off = always recompute.
+        """
         super().__init__()
 
         # Resolve stream dims from the observation dict.
@@ -165,27 +201,70 @@ class SonicBaseModel(nn.Module):
                         self.distribution.log_std_param.copy_(std.log())
 
         self.freeze_base = freeze_base
-        if freeze_base:
-            for module in (self.encoder, self.decoder):
+        self.freeze_encoder = freeze_base if freeze_encoder is None else freeze_encoder
+        self.freeze_decoder = freeze_base if freeze_decoder is None else freeze_decoder
+        for module, frozen in ((self.encoder, self.freeze_encoder), (self.decoder, self.freeze_decoder)):
+            if frozen:
                 for p in module.parameters():
                     p.requires_grad = False
+        # Cache only helps when the encoder is a pure function for the whole update.
+        self.cache_tokens = cache_tokens and self.freeze_encoder
+        self._last_tokens: torch.Tensor | None = None
 
     # --- token pipeline ---
 
     def encode_tokens(
         self, obs: TensorDict, latent_residual: torch.Tensor | None = None
     ) -> torch.Tensor:
-        """Tokenizer obs -> quantized tokens, flattened to (B, token_total_dim)."""
-        z = self.encoder(obs[self.tokenizer_obs_group])
-        z = z.view(*z.shape[:-1], self.num_tokens, self.token_dim)
-        tokens = fsq_quantize(z, self.fsq_levels)
-        tokens = tokens.reshape(*tokens.shape[:-2], self.token_total_dim)
+        """Tokenizer obs -> quantized tokens, flattened to (B, token_total_dim).
+
+        Returns the cached tokens when the rollout storage carries them (see
+        :meth:`storage_obs`); otherwise runs the encoder and stashes the result for
+        :meth:`cache_obs` to pick up. ``latent_residual`` is applied post-cache — it is
+        a trainable correction, so it must never be baked into the stored tokens.
+        """
+        if self.cache_tokens and TOKEN_CACHE_KEY in obs.keys():
+            tokens = obs[TOKEN_CACHE_KEY]
+        else:
+            z = self.encoder(obs[self.tokenizer_obs_group])
+            z = z.view(*z.shape[:-1], self.num_tokens, self.token_dim)
+            tokens = fsq_quantize(z, self.fsq_levels)
+            tokens = tokens.reshape(*tokens.shape[:-2], self.token_total_dim)
+            self._last_tokens = tokens
         if latent_residual is not None:
             tokens = tokens + latent_residual
         return tokens
 
     def _get_proprio(self, obs: TensorDict) -> torch.Tensor:
         return torch.cat([obs[g] for g in self.obs_groups], dim=-1)
+
+    # --- rollout-storage layout (see AmpMixin's sibling contract in the algorithm) ---
+
+    def storage_obs(self, obs: TensorDict) -> TensorDict:
+        """Observation layout the rollout storage should carry.
+
+        Swaps the raw ``tokenizer`` window for the tokens it encodes to: 64 floats in
+        place of 360, so the cache SHRINKS storage rather than growing it. Off (identity)
+        unless the encoder is frozen — a trainable encoder needs the raw window every pass.
+        """
+        if not self.cache_tokens:
+            return obs
+        zeros = torch.zeros(*obs.batch_size, self.token_total_dim, device=obs.device)
+        return self._with_tokens(obs, zeros)
+
+    def cache_obs(self, obs: TensorDict) -> TensorDict:
+        """Return ``obs`` in storage layout, carrying the tokens just computed by ``forward``."""
+        if not self.cache_tokens:
+            return obs
+        if self._last_tokens is None:
+            raise RuntimeError("cache_obs() called before a forward pass produced tokens.")
+        return self._with_tokens(obs, self._last_tokens.detach())
+
+    def _with_tokens(self, obs: TensorDict, tokens: torch.Tensor) -> TensorDict:
+        """``obs`` with the tokenizer window replaced by ``tokens`` (a shallow re-select)."""
+        cached = obs.select(*(k for k in obs.keys() if k != self.tokenizer_obs_group))
+        cached[TOKEN_CACHE_KEY] = tokens
+        return cached
 
     # --- Model API ---
 
@@ -199,8 +278,16 @@ class SonicBaseModel(nn.Module):
     ) -> torch.Tensor:
         """Deterministic action mean (or distribution output) for the given obs."""
         obs = unpad_trajectories(obs, masks) if masks is not None else obs
+        # The encoder stays OUT of autocast: FSQ rounds to a grid of 32 levels over
+        # [-1, 1], and bf16's ~0.06 of resolution at the pre-round scale would flip
+        # boundary cases — a DISCRETE 1/16 jump in a token, far coarser than the
+        # smooth rounding bf16 costs elsewhere. It is also the half that gets cached
+        # out of the update entirely (see storage_obs), so autocasting it buys nothing.
         tokens = self.encode_tokens(obs, latent_residual)
-        return self._head(self._decode(tokens, obs), stochastic_output)
+        # Decoder body under autocast (no-op unless set_amp_dtype was called); head fp32.
+        with self._amp_body():
+            decoded = self._decode(tokens, obs)
+        return self._head(self._head_input(decoded), stochastic_output)
 
     def _decode(self, tokens: torch.Tensor, obs: TensorDict) -> torch.Tensor:
         """Run the decoder over [tokens | proprio]. Adapter variants override this."""

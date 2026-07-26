@@ -51,11 +51,13 @@ class SonicWithAdapterModel(AdapterStreamMixin, SonicBaseModel):
         super().__init__(obs=obs, obs_groups=obs_groups, obs_set=obs_set, output_dim=output_dim, **kwargs)
 
         adapter_dim = self._init_adapter_stream(obs, adapter_obs_group, obs_normalization=True)
+        # The adapters ride the DECODER, so its freeze flag — not the coarse
+        # freeze_base — decides whether the base weights below them are trainable.
         self.decoder = MLPWithAdapter.from_base_mlp(
             self.decoder, adapter_input_dim=adapter_dim, rank=rank, alpha=alpha,
-            freeze_base=self.freeze_base,
+            freeze_base=self.freeze_decoder,
         )
-        self._print_param_summary(self.freeze_base)
+        self._print_param_summary(self.freeze_decoder)
 
     @property
     def _adapted_mlp(self) -> MLPWithAdapter:

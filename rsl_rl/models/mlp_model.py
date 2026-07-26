@@ -11,12 +11,12 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
-from rsl_rl.modules import MLP, EmpiricalNormalization, HiddenState, ModularNormMLP
+from rsl_rl.modules import MLP, AmpMixin, EmpiricalNormalization, HiddenState, ModularNormMLP
 from rsl_rl.modules.distribution import Distribution
 from rsl_rl.utils import resolve_callable, unpad_trajectories
 
 
-class MLPModel(nn.Module):
+class MLPModel(AmpMixin, nn.Module):
     """MLP-based neural model.
 
     This model uses a simple multi-layer perceptron (MLP) to process 1D observation groups. Observations can be
@@ -98,10 +98,11 @@ class MLPModel(nn.Module):
         """
         # If observations are padded for recurrent training but the model is non-recurrent, unpad the observations
         obs = unpad_trajectories(obs, masks) if masks is not None and not self.is_recurrent else obs
-        # Get MLP input latent
-        latent = self.get_latent(obs, masks, hidden_state)
-        # MLP forward pass
-        mlp_output = self.mlp(latent)
+        # Body under autocast (no-op unless set_amp_dtype was called); head always fp32 (see AmpMixin)
+        with self._amp_body():
+            latent = self.get_latent(obs, masks, hidden_state)
+            mlp_output = self.mlp(latent)
+        mlp_output = self._head_input(mlp_output)
         # If stochastic output is requested, update the distribution and sample from it, otherwise return MLP output
         if self.distribution is not None:
             if stochastic_output:
