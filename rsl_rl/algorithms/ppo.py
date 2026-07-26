@@ -187,7 +187,29 @@ class PPO:
         if not self.normalize_advantage_per_mini_batch:
             st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
 
+    def set_amp(self, dtype: str | None) -> None:
+        """Enable autocast for update() — "bfloat16" | "float16" | None (off).
+
+        The actor is a ~10M-param stack run forward+backward once per minibatch
+        per epoch, so the update is the largest block in an iteration. bf16
+        needs no loss scaling; fp16 would (not wired).
+        """
+        self.amp_dtype = getattr(torch, dtype) if dtype else None
+
     def update(self) -> dict[str, float]:
+        """Run optimization epochs; autocast if set_amp() enabled it.
+
+        NOTE: the autocast region spans backward too (wrapping only the forward
+        would mean re-indenting the whole minibatch loop). Grads are still
+        computed in the dtypes autocast recorded on the forward, so this is
+        correct — just not the textbook placement.
+        """
+        if getattr(self, "amp_dtype", None) is None:
+            return self._update()
+        with torch.autocast(device_type=self.device.split(":")[0], dtype=self.amp_dtype):
+            return self._update()
+
+    def _update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
         mean_value_loss = 0
         mean_surrogate_loss = 0
@@ -465,6 +487,7 @@ class PPO:
 
         # Compile the algorithm's models if requested
         alg.compile(cfg.get("torch_compile_mode"))
+        alg.set_amp(cfg.get("amp_dtype"))
 
         return alg
 
