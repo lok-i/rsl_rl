@@ -54,6 +54,11 @@ class Logger:
         self.lenbuffer = deque(maxlen=100)
         self.cur_reward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self.cur_episode_length = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        # Finished-episode rows staged ON DEVICE and drained once per iteration — see
+        # _drain_episode_stats. Extracting them per step costs two host syncs per step
+        # (a data-dependent .nonzero() and a .cpu()) inside the timed rollout, which is
+        # num_envs-independent overhead and therefore dominates at small batch sizes.
+        self._pending_eps: list[torch.Tensor] = []
 
         # Create RND buffers
         if self.cfg["algorithm"]["rnd_cfg"]:
@@ -141,6 +146,19 @@ class Logger:
                 self.cur_reward_sum += rewards
             self.cur_episode_length += 1
 
+            if intrinsic_rewards is None:
+                # Fast path: stage the finished rows on device, transfer once per iteration.
+                # Masking by `done` here (rather than indexing) keeps the output shape static,
+                # so nothing forces a sync; _drain_episode_stats recovers the exact same
+                # per-episode values the eager path produced.
+                done = (dones > 0).float()
+                self._pending_eps.append(
+                    torch.stack((self.cur_reward_sum * done, self.cur_episode_length * done, done))
+                )
+                self.cur_reward_sum.mul_(1.0 - done)
+                self.cur_episode_length.mul_(1.0 - done)
+                return
+
             # Clear data for completed episodes
             new_ids = (dones > 0).nonzero(as_tuple=False)
             self.rewbuffer.extend(self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
@@ -152,6 +170,22 @@ class Logger:
                 self.irewbuffer.extend(self.cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
                 self.cur_ereward_sum[new_ids] = 0
                 self.cur_ireward_sum[new_ids] = 0
+
+    def _drain_episode_stats(self) -> None:
+        """Move one iteration of staged finished-episode rows to the host in ONE transfer.
+
+        Same values, same deque, as the per-step path — only the sync count changes
+        (2 per step -> 1 per iteration). Order within an iteration is (step, env) rather
+        than strictly chronological, which only decides which entries survive the
+        ``maxlen=100`` window; the mean over a window that size is unaffected in practice.
+        """
+        if not self._pending_eps:
+            return
+        staged = torch.stack(self._pending_eps).cpu().numpy()  # (T, 3, num_envs) — the one sync
+        self._pending_eps.clear()
+        finished = staged[:, 2] > 0
+        self.rewbuffer.extend(staged[:, 0][finished].tolist())
+        self.lenbuffer.extend(staged[:, 1][finished].tolist())
 
     def log(
         self,
@@ -173,6 +207,7 @@ class Logger:
 
         If videos are available, they are uploaded to the logging service (W&B) as well.
         """
+        self._drain_episode_stats()
         if self.writer is not None:
             collection_size = self.cfg["num_steps_per_env"] * self.num_envs * self.gpu_world_size
             iteration_time = collect_time + learn_time
