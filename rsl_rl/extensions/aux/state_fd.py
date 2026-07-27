@@ -60,6 +60,7 @@ class StateFdAux(AuxObjective):
         target_slices: dict[str, tuple[int, int]] | None = None,
         autoregress: bool = True,
         start_with_current_step: bool = False,
+        log_z_ablation: bool = True,
         **kwargs: Any,
     ) -> None:
         """Initialize the supervised-FD objective; extra kwargs go to :class:`AuxObjective`."""
@@ -83,6 +84,7 @@ class StateFdAux(AuxObjective):
         )
         self.autoregress = autoregress
         self.start_with_current_step = start_with_current_step
+        self.log_z_ablation = log_z_ablation
         # every window contributes K predictions -> K encoder rows per sampled env column
         self._rows_per_col = len(self._window_starts(storage.num_transitions_per_env)) * self.unroll_steps
         self.target_group = target_group
@@ -147,7 +149,36 @@ class StateFdAux(AuxObjective):
         # backward graph, so peak memory is unchanged.
         starts = self._window_starts(num_t)
         z = self._encode_span(obs, starts, cols)
+        actions = storage.actions[:, cols]
 
+        step_losses, err_sums, err_counts = self._scan(target, z, cond, not_done, actions, starts)
+        loss = torch.stack(step_losses).mean()
+        metrics = {"loss/fd_l1": loss.item()}
+        with torch.no_grad():
+            # Early/late halves WITHIN each window: early rides the window seed (dead
+            # reckoning), late is image-corrected only — the image-dependence diagnostic.
+            if self.unroll_steps >= 2:
+                per_window = torch.stack(step_losses).view(-1, self.unroll_steps)
+                half = self.unroll_steps // 2
+                metrics["fd_l1_early"] = per_window[:, :half].mean().item()
+                metrics["fd_l1_late"] = per_window[:, half:].mean().item()
+            # Row-weighted per-dim mean == the old concat-then-mean (every step contributes
+            # its own row count), so the logged slices are unchanged.
+            per_dim = torch.stack(err_sums).sum(0) / torch.stack(err_counts).sum().clamp(min=1.0)
+            metrics.update(self._slice_metrics(per_dim, "fd_l1_"))
+            metrics.update(self._z_ablation(target, z, cond, not_done, actions, starts, loss))
+        return loss, metrics
+
+    def _scan(
+        self,
+        target: torch.Tensor,
+        z: torch.Tensor,
+        cond: torch.Tensor | None,
+        not_done: torch.Tensor,
+        actions: torch.Tensor,
+        starts: range,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+        """Autoregress every window; returns (per-step losses, per-dim err sums, row counts)."""
         step_losses, err_sums, err_counts = [], [], []
         for w, start in enumerate(starts):
             if self.start_with_current_step:
@@ -156,7 +187,7 @@ class StateFdAux(AuxObjective):
                 parts = [torch.zeros_like(target[start]), z[w, 0]]
                 if cond is not None:
                     parts.append(cond[start])
-                parts.append(torch.zeros_like(storage.actions[start, cols]))
+                parts.append(torch.zeros_like(actions[start]))
                 s_hat = self.predictor(torch.cat(parts, dim=-1))
                 err = (s_hat - target[start]).abs()
                 step_losses.append(err.mean())
@@ -172,7 +203,7 @@ class StateFdAux(AuxObjective):
                 parts = [s_hat, z[w, t - start]]
                 if cond is not None:
                     parts.append(cond[t])
-                parts.append(storage.actions[t, cols])
+                parts.append(actions[t])
                 s_hat = self.predictor(torch.cat(parts, dim=-1))
                 # Loss masked at resets; carry reset to the true post-reset state (target[t+1]
                 # IS the next observation of step t). L1 on normalized targets (reference).
@@ -189,21 +220,33 @@ class StateFdAux(AuxObjective):
                     s_hat = torch.where(not_done[t].unsqueeze(-1).bool(), s_hat, target[t + 1])
                 else:  # teacher forcing: every step reads the TRUE previous state
                     s_hat = target[t + 1]
-        loss = torch.stack(step_losses).mean()
-        metrics = {"loss/fd_l1": loss.item()}
-        with torch.no_grad():
-            # Early/late halves WITHIN each window: early rides the window seed (dead
-            # reckoning), late is image-corrected only — the image-dependence diagnostic.
-            if self.unroll_steps >= 2:
-                per_window = torch.stack(step_losses).view(-1, self.unroll_steps)
-                half = self.unroll_steps // 2
-                metrics["fd_l1_early"] = per_window[:, :half].mean().item()
-                metrics["fd_l1_late"] = per_window[:, half:].mean().item()
-            # Row-weighted per-dim mean == the old concat-then-mean (every step contributes
-            # its own row count), so the logged slices are unchanged.
-            per_dim = torch.stack(err_sums).sum(0) / torch.stack(err_counts).sum().clamp(min=1.0)
-            metrics.update(self._slice_metrics(per_dim, "fd_l1_"))
-        return loss, metrics
+        return step_losses, err_sums, err_counts
+
+    @torch.no_grad()
+    def _z_ablation(
+        self,
+        target: torch.Tensor,
+        z: torch.Tensor,
+        cond: torch.Tensor | None,
+        not_done: torch.Tensor,
+        actions: torch.Tensor,
+        starts: range,
+        loss: torch.Tensor,
+    ) -> dict[str, float]:
+        """Measure how much of the fit z carries, vs (cond, action, dead reckoning).
+
+        Re-scans with z PERMUTED across the minibatch columns: marginal statistics of z are
+        preserved, its pairing with (target, cond, action) is destroyed. ``fd_l1_z_gain`` is
+        the drop in L1 attributable to z — the conditional quantity, since a low ``fd_l1``
+        alone cannot distinguish "z is informative" from "the target was already free".
+        Predictor-only (the encode is reused), no backward: cheap next to the real pass.
+        """
+        if not self.log_z_ablation:
+            return {}
+        perm = torch.randperm(z.shape[2], device=z.device)
+        sh_losses, _, _ = self._scan(target, z[:, :, perm], cond, not_done, actions, starts)
+        shuffled = torch.stack(sh_losses).mean()
+        return {"fd_l1_shuffled_z": shuffled.item(), "fd_l1_z_gain": (shuffled - loss).item()}
 
     def _encode_span(self, obs: dict, starts: range, cols: torch.Tensor) -> torch.Tensor:
         """Encode every window's K steps in ONE extractor pass -> ``(windows, K, mb, latent)``.

@@ -406,6 +406,16 @@ class PPO:
         if logp_drift is not None:
             info_dict["Diagnostics/logp_drift_mb0"] = logp_drift.item()
 
+        # Extractor-owned diagnostics (attention entropy, z rank/std). Drained here in
+        # the BASE algorithm, not in PPOAux, so the extractor-only row (plain PPO, no
+        # auxiliary objective) reports them as well — it is the baseline the aux rows
+        # are compared against.
+        for name, extractor in getattr(self._raw_actor, "extractors", {}).items():
+            if hasattr(extractor, "metrics"):
+                prefix = "" if name in ("extractor_input", "") else f"{name}_"
+                for key, value in extractor.metrics().items():
+                    info_dict[f"Auxiliaries/{prefix}{key}"] = value
+
         # Clear the storage
         self.storage.clear()
 

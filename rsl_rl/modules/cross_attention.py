@@ -89,6 +89,7 @@ class CrossAttentionExtractor(nn.Module):
             f"learned{i}" for i in range(num_learned_queries)
         ]
         self.last_attn: torch.Tensor | None = None
+        self.last_z: torch.Tensor | None = None
 
     @classmethod
     def from_obs(
@@ -142,7 +143,39 @@ class CrossAttentionExtractor(nn.Module):
         global LATEST_ATTENTION
         self.last_attn = attn.detach()
         LATEST_ATTENTION = self
-        return self.out_norm(self.proj((attn @ values).flatten(1)))
+        z = self.out_norm(self.proj((attn @ values).flatten(1)))
+        self.last_z = z.detach()
+        return z
+
+    @torch.no_grad()
+    def metrics(self, max_samples: int = 4096) -> dict[str, float]:
+        """Extractor-owned diagnostics of the LAST forward — no storage pass, no encode.
+
+        Lives here rather than on the aux objective so the extractor-only row (``-Ext``,
+        plain PPO, no ``AuxObjective``) logs them too: that is the baseline the aux rows
+        are read against. Keys are ``z_*`` / ``attn_ent_*``, deliberately distinct from
+        ``AuxObjective.latent_metrics``' ``latent_*`` — those sample the storage, these
+        sample the last minibatch, so the two are NOT comparable. Compare row-to-row
+        within one key.
+
+        - ``attn_ent_<label>``: entropy (nats) of each query row's attention over the P
+          tokens. -> log(P) means the row is diffuse, i.e. it degenerates to mean-pooling
+          the values regardless of its query; two diffuse rows are the same row.
+        - ``z_rankme`` (Garrido et al. 2023) / ``z_std``: capacity + collapse alarm.
+        """
+        out: dict[str, float] = {}
+        if self.last_attn is not None:
+            ent = -(self.last_attn * (self.last_attn + 1e-12).log()).sum(-1).mean(0)  # (Q,)
+            for label, value in zip(self.query_labels, ent.tolist(), strict=True):
+                out[f"attn_ent_{label}"] = value
+            out["attn_ent_mean"] = ent.mean().item()
+        if self.last_z is not None:
+            z = self.last_z[:max_samples].float()
+            sv = torch.linalg.svdvals(z)
+            p = sv / sv.sum() + 1e-12
+            out["z_rankme"] = torch.exp(-(p * p.log()).sum()).item()
+            out["z_std"] = z.std(dim=0).mean().item()
+        return out
 
     def update_normalization(self, token_td: TensorDict, *query_vecs: torch.Tensor) -> None:
         """Update per-term token and per-group query normalization statistics."""
