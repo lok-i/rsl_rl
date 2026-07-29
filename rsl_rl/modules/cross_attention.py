@@ -164,12 +164,15 @@ class CrossAttentionExtractor(nn.Module):
             mean-pooling the values regardless of its query; two diffuse rows are the same
             row. Normalizing makes the number survive a resolution/patch change, which
             moves P and therefore the raw-nats ceiling.
-          - ``row_div``: mean pairwise total-variation distance between rows, [0, 1].
-            0 = every row attends identically, so the extra rows are duplicate ``proj``
-            parameters. Entropy says how concentrated a row is; this says whether the
-            rows are looking at DIFFERENT places, which is the property that justifies
-            keeping more than one.
-          - ``tokens``: P. Logged so the normalizer above is auditable from the run alone.
+          - ``query_div``: mean pairwise total-variation distance between the QUERY rows
+            (not image rows — a "row" here is one query group's attention distribution
+            over all P tokens), [0, 1]. 0 = every query attends identically, so the extra
+            rows are duplicate ``proj`` parameters. Entropy says how concentrated one
+            query is; this says whether the queries are looking at DIFFERENT places,
+            which is the property that justifies keeping more than one of them.
+
+        P is deliberately NOT logged: it is constant for a run and already implied by the
+        camera cfg and the backbone's patch stride, both of which the run dumps.
 
         ``ZCapacity``
           - ``rankme`` (Garrido et al. 2023) / ``rank_frac``: effective number of latent
@@ -185,15 +188,14 @@ class CrossAttentionExtractor(nn.Module):
             ceiling = math.log(num_tokens) if num_tokens > 1 else 1.0
             for label, value in zip(self.query_labels, ent.tolist(), strict=True):
                 out[f"ZAttention/{label}"] = value / ceiling
-            out["ZAttention/tokens"] = float(num_tokens)
             if attn.shape[1] > 1:
-                rows = attn.mean(0)  # (Q, P) — the batch-mean attention of each row
+                queries = attn.mean(0)  # (Q, P) — each query row's batch-mean attention
                 pairs = [
-                    0.5 * (rows[i] - rows[j]).abs().sum()
-                    for i in range(rows.shape[0])
-                    for j in range(i + 1, rows.shape[0])
+                    0.5 * (queries[i] - queries[j]).abs().sum()
+                    for i in range(queries.shape[0])
+                    for j in range(i + 1, queries.shape[0])
                 ]
-                out["ZAttention/row_div"] = torch.stack(pairs).mean().item()
+                out["ZAttention/query_div"] = torch.stack(pairs).mean().item()
         if self.last_z is not None:
             z = self.last_z[:max_samples].float()
             sv = torch.linalg.svdvals(z)
