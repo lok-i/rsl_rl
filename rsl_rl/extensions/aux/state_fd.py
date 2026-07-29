@@ -57,17 +57,16 @@ class StateFdAux(AuxObjective):
         storage: RolloutStorage,
         actor: nn.Module,
         target_group: str = "prediction_target",
-        target_slices: dict[str, tuple[int, int]] | None = None,
         autoregress: bool = True,
         start_with_current_step: bool = False,
-        log_z_ablation: bool = True,
+        log_z_ablation: bool | str = "both",
         **kwargs: Any,
     ) -> None:
         """Initialize the supervised-FD objective; extra kwargs go to :class:`AuxObjective`."""
         kwargs.setdefault("condition_group", "prediction_conditioning")
         obs: TensorDict = storage.observations
         extractor = actor.extractors[kwargs.get("extractor_group", "extractor_input")]
-        self.target_slices = self._resolve_slices(obs[target_group].shape[-1], target_slices)
+        self._target_terms, self.target_slices = self._target_layout(obs[target_group])
         target_dim = sum(b - a for a, b in self.target_slices.values())
         cond_dim = self.cond_dim_of(obs, kwargs.get("condition_group"), kwargs.get("condition_slices"))
         action_dim = storage.actions.shape[-1]
@@ -90,6 +89,41 @@ class StateFdAux(AuxObjective):
         self.target_group = target_group
         self.target_normalizer = EmpiricalNormalization(target_dim)
         self._finalize()
+        num_t = storage.num_transitions_per_env
+        covered = len(self._window_starts(num_t)) * self.unroll_steps
+        tail = "" if covered == num_t - 1 else f" — trailing {num_t - 1 - covered} UNUSED"
+        print(
+            f"  (target): {len(self.target_slices)} slices, {target_dim} dims — "
+            + ", ".join(f"{n}[{b - a}]" for n, (a, b) in self.target_slices.items())
+            + f"\n  (windows): {len(self._window_starts(num_t))} x K={self.unroll_steps} -> "
+            f"targets 1..{covered} of {num_t - 1} stored transitions{tail}"
+        )
+
+    @staticmethod
+    def _target_layout(td: TensorDict | torch.Tensor) -> tuple[list[str] | None, dict[str, tuple[int, int]]]:
+        """Named contiguous slices of the target group, INFERRED — never declared.
+
+        A dict group (``concatenate_terms=False``) gives one slice PER OBSERVATION TERM,
+        with both the name and the width read straight off the group. Nothing to keep in
+        sync across files, and a term added to the group can no longer be silently sliced
+        off the loss — which was the old failure mode of a hand-written (name, dim) table.
+        A flat group keeps a single "all" slice: concatenation has already destroyed term
+        identity, so there is nothing to recover.
+        """
+        if not hasattr(td, "keys"):
+            return None, {"all": (0, td.shape[-1])}
+        terms, out, offset = list(td.keys()), {}, 0
+        for name in terms:
+            width = td[name].shape[-1]
+            out[name] = (offset, offset + width)
+            offset += width
+        return terms, out
+
+    def _select_target(self, x: TensorDict | torch.Tensor) -> torch.Tensor:
+        """Concatenate the target terms (dict group) or the configured slices (flat)."""
+        if self._target_terms is None:
+            return super()._select_target(x)
+        return torch.cat([x[name] for name in self._target_terms], dim=-1)
 
     def _obs_keys(self) -> list[str]:
         keys = [self.target_group]
@@ -98,7 +132,13 @@ class StateFdAux(AuxObjective):
         return keys
 
     def _window_starts(self, num_t: int) -> range:
-        """Disjoint window starts covering the rollout (last partial window dropped)."""
+        """Disjoint window starts covering the rollout (last partial window dropped).
+
+        Full coverage needs ``num_t = n*K + 1``; otherwise the tail transitions never enter
+        the loss (T=24, K=10 -> targets 1..20, steps 21-23 unused). A sampling loss, not a
+        correctness one — fresh data arrives every iteration — but it is printed at init so
+        it stays a decision rather than a surprise.
+        """
         return range(0, num_t - self.unroll_steps, self.unroll_steps)
 
     def sample_loss(self, storage: RolloutStorage) -> tuple[torch.Tensor, dict[str, float]] | None:
@@ -130,9 +170,7 @@ class StateFdAux(AuxObjective):
                 for key, value in metrics.items():
                     totals[key] = totals.get(key, 0.0) + value
                 num_updates += 1
-        out = {key: value / num_updates for key, value in totals.items()}
-        out.update(self.latent_metrics(storage))
-        return out
+        return {key: value / num_updates for key, value in totals.items()}
 
     def _scan_loss(self, storage: RolloutStorage, cols: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
         obs, num_t = storage.observations, storage.num_transitions_per_env
@@ -153,19 +191,27 @@ class StateFdAux(AuxObjective):
 
         step_losses, err_sums, err_counts = self._scan(target, z, cond, not_done, actions, starts)
         loss = torch.stack(step_losses).mean()
-        metrics = {"loss/fd_l1": loss.item()}
+        metrics = {"loss/fd_l1": loss.item(), "ZPrediction/total": loss.item()}
         with torch.no_grad():
+            # The RULER. fd_l1 is L1 on normalized targets, so it is measured in units of
+            # the target's own spread — and EmpiricalNormalization is CUMULATIVE, so that
+            # spread keeps moving as the policy changes what it produces. A slice whose raw
+            # error tripled can log a flat curve if sigma tripled with it. Logging sigma
+            # makes the curve readable: fd_l1 * ruler ~ the error in raw units.
+            metrics["ZPrediction/ruler"] = (
+                self.target_normalizer.std + self.target_normalizer.eps
+            ).mean().item()
             # Early/late halves WITHIN each window: early rides the window seed (dead
             # reckoning), late is image-corrected only — the image-dependence diagnostic.
             if self.unroll_steps >= 2:
                 per_window = torch.stack(step_losses).view(-1, self.unroll_steps)
                 half = self.unroll_steps // 2
-                metrics["fd_l1_early"] = per_window[:, :half].mean().item()
-                metrics["fd_l1_late"] = per_window[:, half:].mean().item()
+                metrics["ZPrediction/early"] = per_window[:, :half].mean().item()
+                metrics["ZPrediction/late"] = per_window[:, half:].mean().item()
             # Row-weighted per-dim mean == the old concat-then-mean (every step contributes
             # its own row count), so the logged slices are unchanged.
             per_dim = torch.stack(err_sums).sum(0) / torch.stack(err_counts).sum().clamp(min=1.0)
-            metrics.update(self._slice_metrics(per_dim, "fd_l1_"))
+            metrics.update(self._slice_metrics(per_dim, "ZPrediction/"))
             metrics.update(self._z_ablation(target, z, cond, not_done, actions, starts, loss))
         return loss, metrics
 
@@ -222,6 +268,26 @@ class StateFdAux(AuxObjective):
                     s_hat = target[t + 1]
         return step_losses, err_sums, err_counts
 
+    @staticmethod
+    def _shuffle_z(z: torch.Tensor, mode: str) -> torch.Tensor:
+        """Permute z ``(windows, K, mb, latent)`` across the minibatch column axis.
+
+        ``col``  — ONE permutation reused for every (window, step). The shuffled z is still
+                   a temporally coherent trajectory, just from the wrong environment: only
+                   the pairing with (target, cond, action) is destroyed.
+        ``step`` — a FRESH permutation per (window, step), so temporal coherence goes too.
+
+        Marginals are identical either way; the pair brackets z's contribution. ``col``
+        leaves the predictor a usable temporal signal, so it is the conservative bound;
+        the gap between the two is how much of z's value is temporal consistency rather
+        than instantaneous content.
+        """
+        mb = z.shape[2]
+        if mode == "col":
+            return z[:, :, torch.randperm(mb, device=z.device)]
+        perm = torch.rand(z.shape[0], z.shape[1], mb, device=z.device).argsort(dim=2)
+        return z.gather(2, perm.unsqueeze(-1).expand_as(z))
+
     @torch.no_grad()
     def _z_ablation(
         self,
@@ -235,18 +301,27 @@ class StateFdAux(AuxObjective):
     ) -> dict[str, float]:
         """Measure how much of the fit z carries, vs (cond, action, dead reckoning).
 
-        Re-scans with z PERMUTED across the minibatch columns: marginal statistics of z are
-        preserved, its pairing with (target, cond, action) is destroyed. ``fd_l1_z_gain`` is
-        the drop in L1 attributable to z — the conditional quantity, since a low ``fd_l1``
-        alone cannot distinguish "z is informative" from "the target was already free".
-        Predictor-only (the encode is reused), no backward: cheap next to the real pass.
+        Re-scan with z re-paired to the wrong environments; the rise in L1 is z's
+        contribution. This is the CONDITIONAL quantity, since a low ``fd_l1`` alone cannot
+        distinguish "z is informative" from "the target was already free from (cond, s_hat,
+        a)". ``gain_frac`` is the same number as a fraction of the achievable fit — unit-free,
+        so it survives a change of target set. Predictor-only (the encode is reused), no
+        backward: one extra unroll per mode.
         """
-        if not self.log_z_ablation:
-            return {}
-        perm = torch.randperm(z.shape[2], device=z.device)
-        sh_losses, _, _ = self._scan(target, z[:, :, perm], cond, not_done, actions, starts)
-        shuffled = torch.stack(sh_losses).mean()
-        return {"fd_l1_shuffled_z": shuffled.item(), "fd_l1_z_gain": (shuffled - loss).item()}
+        modes = {"col": ("col",), "step": ("step",), "both": ("col", "step")}.get(
+            "both" if self.log_z_ablation is True else self.log_z_ablation or "", ()
+        )
+        out: dict[str, float] = {}
+        for mode in modes:
+            sh_losses, _, _ = self._scan(
+                target, self._shuffle_z(z, mode), cond, not_done, actions, starts
+            )
+            shuffled = torch.stack(sh_losses).mean()
+            out[f"ZPrediction/shuffled_{mode}"] = shuffled.item()
+            out[f"ZPrediction/gain_{mode}"] = (shuffled - loss).item()
+            if shuffled > 0:
+                out[f"ZPrediction/gain_frac_{mode}"] = ((shuffled - loss) / shuffled).item()
+        return out
 
     def _encode_span(self, obs: dict, starts: range, cols: torch.Tensor) -> torch.Tensor:
         """Encode every window's K steps in ONE extractor pass -> ``(windows, K, mb, latent)``.

@@ -105,7 +105,7 @@ class LatentFdAux(AuxObjective):
             z_tgt = self._encode_span(flat, idx, num_envs, self.unroll_steps + 1, self.ema_extractor)
             # Do-nothing floor: distance between consecutive targets. A learned loss that only
             # matches this is exploiting temporal smoothness, not dynamics.
-            metrics["latent_floor"] = functional.mse_loss(z_tgt[0], z_tgt[1]).item()
+            metrics["ZPrediction/floor"] = functional.mse_loss(z_tgt[0], z_tgt[1]).item()
         z_ar, cond = None, None
         for k in range(self.unroll_steps):
             action = actions[idx + k * num_envs]
@@ -121,10 +121,11 @@ class LatentFdAux(AuxObjective):
                 if k > 0:  # k = 0 is identical to the TF term — count it once
                     losses_ar.append(functional.mse_loss(self.predictor(z_ar), target))
         loss = torch.stack(losses_tf + losses_ar).mean()
-        metrics["loss/latent_mse"] = loss.item()
-        metrics["latent_tf_mse"] = torch.stack(losses_tf).mean().item()
+        metrics["loss/z_mse"] = loss.item()
+        metrics["ZPrediction/total"] = loss.item()
+        metrics["ZPrediction/tf"] = torch.stack(losses_tf).mean().item()
         if losses_ar:
-            metrics["latent_ar_mse"] = torch.stack(losses_ar).mean().item()
+            metrics["ZPrediction/ar"] = torch.stack(losses_ar).mean().item()
         return loss, metrics
 
     def _encode_span(

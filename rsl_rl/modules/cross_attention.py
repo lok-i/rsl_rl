@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
@@ -152,29 +153,55 @@ class CrossAttentionExtractor(nn.Module):
         """Extractor-owned diagnostics of the LAST forward — no storage pass, no encode.
 
         Lives here rather than on the aux objective so the extractor-only row (``-Ext``,
-        plain PPO, no ``AuxObjective``) logs them too: that is the baseline the aux rows
-        are read against. Keys are ``z_*`` / ``attn_ent_*``, deliberately distinct from
-        ``AuxObjective.latent_metrics``' ``latent_*`` — those sample the storage, these
-        sample the last minibatch, so the two are NOT comparable. Compare row-to-row
-        within one key.
+        plain PPO, no ``AuxObjective``) logs them too. That is what makes ``ZAttention/*``
+        and ``ZCapacity/*`` the ONLY sections comparable across the aux variants: they
+        describe z itself, not any objective's fit to it. Both sample the LAST minibatch
+        of the update, so they are noisy per-iteration and meant to be read smoothed.
 
-        - ``attn_ent_<label>``: entropy (nats) of each query row's attention over the P
-          tokens. -> log(P) means the row is diffuse, i.e. it degenerates to mean-pooling
-          the values regardless of its query; two diffuse rows are the same row.
-        - ``z_rankme`` (Garrido et al. 2023) / ``z_std``: capacity + collapse alarm.
+        ``ZAttention``
+          - ``<label>``: each query row's attention entropy over the P tokens, NORMALIZED
+            by log(P) -> [0, 1]. 1 means the row is diffuse, i.e. it degenerates to
+            mean-pooling the values regardless of its query; two diffuse rows are the same
+            row. Normalizing makes the number survive a resolution/patch change, which
+            moves P and therefore the raw-nats ceiling.
+          - ``row_div``: mean pairwise total-variation distance between rows, [0, 1].
+            0 = every row attends identically, so the extra rows are duplicate ``proj``
+            parameters. Entropy says how concentrated a row is; this says whether the
+            rows are looking at DIFFERENT places, which is the property that justifies
+            keeping more than one.
+          - ``tokens``: P. Logged so the normalizer above is auditable from the run alone.
+
+        ``ZCapacity``
+          - ``rankme`` (Garrido et al. 2023) / ``rank_frac``: effective number of latent
+            directions in use, absolute and as a fraction of ``latent_dim``.
+          - ``std``: mean per-dim std — the collapse alarm RankMe structurally cannot
+            raise, being scale-invariant. Read the pair, never one alone.
         """
         out: dict[str, float] = {}
         if self.last_attn is not None:
-            ent = -(self.last_attn * (self.last_attn + 1e-12).log()).sum(-1).mean(0)  # (Q,)
+            attn = self.last_attn
+            num_tokens = attn.shape[-1]
+            ent = -(attn * (attn + 1e-12).log()).sum(-1).mean(0)  # (Q,) nats
+            ceiling = math.log(num_tokens) if num_tokens > 1 else 1.0
             for label, value in zip(self.query_labels, ent.tolist(), strict=True):
-                out[f"attn_ent_{label}"] = value
-            out["attn_ent_mean"] = ent.mean().item()
+                out[f"ZAttention/{label}"] = value / ceiling
+            out["ZAttention/tokens"] = float(num_tokens)
+            if attn.shape[1] > 1:
+                rows = attn.mean(0)  # (Q, P) — the batch-mean attention of each row
+                pairs = [
+                    0.5 * (rows[i] - rows[j]).abs().sum()
+                    for i in range(rows.shape[0])
+                    for j in range(i + 1, rows.shape[0])
+                ]
+                out["ZAttention/row_div"] = torch.stack(pairs).mean().item()
         if self.last_z is not None:
             z = self.last_z[:max_samples].float()
             sv = torch.linalg.svdvals(z)
             p = sv / sv.sum() + 1e-12
-            out["z_rankme"] = torch.exp(-(p * p.log()).sum()).item()
-            out["z_std"] = z.std(dim=0).mean().item()
+            rankme = torch.exp(-(p * p.log()).sum()).item()
+            out["ZCapacity/rankme"] = rankme
+            out["ZCapacity/rank_frac"] = rankme / self.latent_dim
+            out["ZCapacity/std"] = z.std(dim=0).mean().item()
         return out
 
     def update_normalization(self, token_td: TensorDict, *query_vecs: torch.Tensor) -> None:

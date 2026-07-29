@@ -363,6 +363,10 @@ class PPO:
             for model in (self.actor, self.critic):
                 if hasattr(model, "project_weights"):
                     model.project_weights()
+            # Extension seam: subclasses may inspect the REALIZED parameter delta of this
+            # minibatch (post-clip, post-Adam, post-projection) — e.g. PPOAux attributing
+            # the step to its gradient sources.
+            self._post_optimizer_step()
             # Apply the gradients for RND
             if self.rnd:
                 self.rnd.optimizer.step()
@@ -406,15 +410,21 @@ class PPO:
         if logp_drift is not None:
             info_dict["Diagnostics/logp_drift_mb0"] = logp_drift.item()
 
-        # Extractor-owned diagnostics (attention entropy, z rank/std). Drained here in
-        # the BASE algorithm, not in PPOAux, so the extractor-only row (plain PPO, no
+        # Extractor-owned diagnostics (ZAttention/*, ZCapacity/*). Drained here in the
+        # BASE algorithm, not in PPOAux, so the extractor-only row (plain PPO, no
         # auxiliary objective) reports them as well — it is the baseline the aux rows
-        # are compared against.
-        for name, extractor in getattr(self._raw_actor, "extractors", {}).items():
+        # are compared against, and it is why these two sections are the ONLY ones
+        # comparable across -Ext / -Sfd / -Lfd. The extractor emits fully-qualified
+        # keys; the group name is folded in only when several extractors are registered
+        # (one, the common case, keeps the keys short).
+        extractors = getattr(self._raw_actor, "extractors", {})
+        for name, extractor in extractors.items():
             if hasattr(extractor, "metrics"):
-                prefix = "" if name in ("extractor_input", "") else f"{name}_"
                 for key, value in extractor.metrics().items():
-                    info_dict[f"Auxiliaries/{prefix}{key}"] = value
+                    if len(extractors) > 1:
+                        section, _, leaf = key.partition("/")
+                        key = f"{section}/{name}.{leaf}"
+                    info_dict[key] = value
 
         # Clear the storage
         self.storage.clear()
@@ -423,6 +433,10 @@ class PPO:
 
     def _extra_backward(self) -> None:
         """Accumulate extra per-minibatch gradients before the optimizer step. No-op for PPO."""
+        pass
+
+    def _post_optimizer_step(self) -> None:
+        """Inspect the realized parameter delta after the optimizer step. No-op for PPO."""
         pass
 
     def train_mode(self) -> None:

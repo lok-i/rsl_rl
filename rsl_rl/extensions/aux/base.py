@@ -12,7 +12,11 @@ as an accumulated gradient inside each PPO minibatch (``joint``) — and reads t
 ``(obs_t, a_t, ..., obs_t+K)`` views straight from the rollout storage; no extra buffers.
 
 Metric key convention: ``loss/<name>`` marks the objective's actual loss (routed to the
-``Loss/`` logger section); every other key is a diagnostic (routed to ``Auxiliaries/``).
+``Loss/`` logger section); every other key is a diagnostic and carries its own fully
+qualified section, which the algorithm passes through verbatim — the producer owns the
+name. Objective-fit diagnostics go to ``ZPrediction/*``; the sections describing z itself
+(``ZAttention/*``, ``ZCapacity/*``) belong to the extractor, so that the extractor-only
+row reports them too and they stay comparable across objectives.
 """
 
 from __future__ import annotations
@@ -216,26 +220,15 @@ class AuxObjective(nn.Module):
                 for key, value in metrics.items():
                     totals[key] = totals.get(key, 0.0) + value
                 num_updates += 1
-        out = {key: value / num_updates for key, value in totals.items()}
-        out.update(self.latent_metrics(storage))
-        return out
+        return {key: value / num_updates for key, value in totals.items()}
 
-    @torch.no_grad()
-    def latent_metrics(self, storage: RolloutStorage, max_samples: int = 4096) -> dict[str, float]:
-        """Capacity/collapse diagnostics of the latent z over a rollout sample.
-
-        RankMe (Garrido et al. 2023): exp-entropy of the normalized singular-value spectrum —
-        the effective number of independent dimensions z actually uses (elbow-plot metric for
-        latent_dim ablations). latent_std: mean per-dim std, the cheap collapse alarm.
-        """
-        flat = {g: storage.observations[g].flatten(0, 1) for g in self._extractor_groups()}
-        num_rows = next(iter(flat.values())).shape[0]
-        idx = torch.randperm(num_rows, device=storage.dones.device)[:max_samples]
-        z = self._encode(flat, idx)
-        sv = torch.linalg.svdvals(z.float())
-        p = sv / sv.sum() + 1e-12
-        rankme = torch.exp(-(p * p.log()).sum())
-        return {"latent_rankme": rankme.item(), "latent_std": z.std(dim=0).mean().item()}
+    # NOTE: the z capacity/collapse diagnostics (RankMe, std) live on the EXTRACTOR
+    # (``CrossAttentionExtractor.metrics`` -> ``ZCapacity/*``), not here. They used to be
+    # duplicated: a storage re-encode of 4096 rows on this side and the last minibatch on
+    # the extractor's. The two tracked each other to ~1% while the storage version cost an
+    # extra encoder forward every iteration and could not be reported by the extractor-only
+    # (``-Ext``) row at all — which is precisely the baseline the aux rows are read against.
+    # One definition, owned by the module the metric describes.
 
     # --- subclass interface ---
 
