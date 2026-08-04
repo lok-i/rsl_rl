@@ -21,6 +21,7 @@ Token flow::
 from __future__ import annotations
 
 import copy
+import re
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
@@ -36,6 +37,35 @@ from ._onnx_export import (
     capture_obs_shapes,
     plain_mlp_copy,
 )
+
+
+def _std_multiplier(
+    std_scale: float | dict[str, float],
+    joint_order: list[str] | None,
+    action_dim: int,
+) -> torch.Tensor:
+    """Per-dim multiplier on the ckpt's ``action_std``.
+
+    A scalar, or ``{regex: factor}`` matched against the checkpoint's own
+    ``meta['joint_order']`` (unmatched joints -> 1.0).
+
+    Scales EXPLORATION only. std is not an input to encoder/FSQ/decoder, so the
+    frozen base's mean action is untouched and construction stays bit-exact —
+    unlike the action term's `scale`, which the base's output is calibrated to
+    and which must never be retuned to buy exploration.
+    """
+    if not isinstance(std_scale, dict):
+        return torch.full((action_dim,), float(std_scale))
+    if joint_order is None:
+        raise ValueError("dict std_scale needs meta['joint_order'] in the checkpoint")
+    mult = torch.ones(action_dim)
+    for pattern, factor in std_scale.items():
+        hits = [i for i, n in enumerate(joint_order) if re.fullmatch(pattern, n)]
+        if not hits:
+            raise ValueError(f"std_scale pattern {pattern!r} matched no joint")
+        mult[hits] = float(factor)
+    return mult
+
 
 TOKEN_CACHE_KEY = "_sonic_tokens"
 """Observation key carrying pre-quantized tokens through the rollout storage (see
@@ -121,6 +151,9 @@ class SonicBaseModel(AmpMixin, nn.Module):
         base_checkpoint: str | None = None,
         freeze_base: bool = True,
         cache_tokens: bool = True,
+        # APPEND-ONLY below: these params are positional-or-keyword, so inserting
+        # anywhere above silently rebinds a positional caller's argument.
+        std_scale: float | dict[str, float] = 1.0,
     ) -> None:
         """Build the encoder/FSQ/decoder stack; dims inferred from ``obs``.
 
@@ -129,6 +162,9 @@ class SonicBaseModel(AmpMixin, nn.Module):
             cache_tokens: Carry the encoder's tokens through the rollout storage rather
                 than recomputing them every update pass. Requires ``freeze_base`` (and, in
                 adapter subclasses, an unadapted encoder); ignored otherwise.
+            std_scale: Multiplier on the checkpoint's per-dim ``action_std`` — a scalar,
+                or ``{joint-name regex: factor}``. Exploration only; 1.0 is a no-op.
+                See :func:`_std_multiplier`.
         """
         super().__init__()
 
@@ -181,6 +217,9 @@ class SonicBaseModel(AmpMixin, nn.Module):
             action_std = payload.get("meta", {}).get("action_std")
             if action_std is not None and self.distribution is not None:
                 std = torch.as_tensor(action_std, dtype=torch.float32)
+                std = std * _std_multiplier(
+                    std_scale, payload.get("meta", {}).get("joint_order"), std.shape[0]
+                )
                 with torch.no_grad():
                     if hasattr(self.distribution, "std_param"):
                         self.distribution.std_param.copy_(std)
