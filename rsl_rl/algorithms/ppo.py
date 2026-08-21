@@ -16,7 +16,13 @@ from rsl_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_c
 from rsl_rl.models import MLPModel
 from rsl_rl.modules import resolve_amp_dtype, set_model_amp
 from rsl_rl.storage import RolloutStorage
-from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
+from rsl_rl.utils import (
+    compile_model,
+    model_diagnostics,
+    resolve_callable,
+    resolve_obs_groups,
+    resolve_optimizer,
+)
 
 
 class PPO:
@@ -403,28 +409,16 @@ class PPO:
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
 
-        # Adapter diagnostics: per-layer norms (separate from losses)
-        info_dict = {}
-        if hasattr(self.actor, "adapter_diagnostics"):
-            info_dict.update(self.actor.adapter_diagnostics())
+        # Model-owned diagnostics: AdapterStats/* per-layer LoRA norms, and the extractor's
+        # ZAttention/* + ZCapacity/*. Drained in the BASE algorithm, not in PPOAux, so the
+        # extractor-only row (plain PPO, no auxiliary objective) reports them as well — it
+        # is the baseline the aux rows are compared against, and it is why those two
+        # sections are the ONLY ones comparable across -Ext / -Sfd / -Lfd. Shared with
+        # Distillation for the same reason: a distilled student must stay readable against
+        # the PPO row it is measured against.
+        info_dict = model_diagnostics(self._raw_actor)
         if logp_drift is not None:
             info_dict["Diagnostics/logp_drift_mb0"] = logp_drift.item()
-
-        # Extractor-owned diagnostics (ZAttention/*, ZCapacity/*). Drained here in the
-        # BASE algorithm, not in PPOAux, so the extractor-only row (plain PPO, no
-        # auxiliary objective) reports them as well — it is the baseline the aux rows
-        # are compared against, and it is why these two sections are the ONLY ones
-        # comparable across -Ext / -Sfd / -Lfd. The extractor emits fully-qualified
-        # keys; the group name is folded in only when several extractors are registered
-        # (one, the common case, keeps the keys short).
-        extractors = getattr(self._raw_actor, "extractors", {})
-        for name, extractor in extractors.items():
-            if hasattr(extractor, "metrics"):
-                for key, value in extractor.metrics().items():
-                    if len(extractors) > 1:
-                        section, _, leaf = key.partition("/")
-                        key = f"{section}/{name}.{leaf}"
-                    info_dict[key] = value
 
         # Clear the storage
         self.storage.clear()

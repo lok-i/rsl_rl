@@ -12,8 +12,15 @@ from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
 from rsl_rl.models import MLPModel
+from rsl_rl.modules import resolve_amp_dtype, set_model_amp
 from rsl_rl.storage import RolloutStorage
-from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
+from rsl_rl.utils import (
+    compile_model,
+    model_diagnostics,
+    resolve_callable,
+    resolve_obs_groups,
+    resolve_optimizer,
+)
 
 
 class Distillation:
@@ -97,9 +104,19 @@ class Distillation:
         # Compute the actions
         self.transition.actions = self.student(obs, stochastic_output=True).detach()
         self.transition.privileged_actions = self.teacher(obs).detach()
-        # Record the observations
-        self.transition.observations = obs
+        # Record the observations in the STUDENT's storage layout: a frozen-prefix model
+        # swaps raw inputs for the values it just derived from them, so the update reads
+        # the cached result instead of recomputing a pure function (SonicBaseModel.
+        # storage_obs). Identity for models without the hook — but it must MATCH the
+        # layout construct_algorithm allocated the storage with, or add_transition's
+        # copy_ fails on the key set. Both or neither.
+        self.transition.observations = self._cache_obs(obs)
         return self.transition.actions  # type: ignore
+
+    def _cache_obs(self, obs: TensorDict) -> TensorDict:
+        """Storage layout carrying this step's cached derivations (identity without the hook)."""
+        hook = getattr(self._raw_student, "cache_obs", None)
+        return hook(obs) if hook is not None else obs
 
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
@@ -121,12 +138,20 @@ class Distillation:
         # Not needed for distillation
         pass
 
-    def update(self) -> dict[str, float]:
-        """Run optimization epochs over stored batches and return mean losses."""
+    def update(self) -> tuple[dict[str, float], dict[str, float]]:
+        """Run optimization epochs over stored batches; return (losses, diagnostics).
+
+        Two-tuple, matching :meth:`PPO.update` — the runner unpacks both and hands
+        ``info_dict`` to the logger. The diagnostics are the MODEL's (AdapterStats/*,
+        ZAttention/*, ZCapacity/*), which is what keeps a distilled student readable
+        against the PPO row it is measured against.
+        """
         self.num_updates += 1
         mean_behavior_loss = 0
+        mean_gap_sq = 0.0
         loss = 0
         cnt = 0
+        std = self._frozen_std()
 
         for epoch in range(self.num_learning_epochs):
             self.student.reset(hidden_state=self.last_hidden_states[0])
@@ -138,6 +163,15 @@ class Distillation:
 
                 # Behavior cloning loss
                 behavior_loss = self.loss_fn(actions, batch.privileged_actions)
+
+                # ZDistill/gap_sigma: the same residual in units of the policy's OWN
+                # exploration band. Diagnostic only — it never touches the gradient. The
+                # raw loss is in action units (rad^2 for mse), which is not comparable
+                # across joints whose frozen sigma differs by ~1.7x, nor across tasks;
+                # this one reads as "the student is N exploration bands off the teacher".
+                if std is not None:
+                    with torch.no_grad():
+                        mean_gap_sq += (((actions - batch.privileged_actions) / std) ** 2).mean().item()
 
                 # Total loss
                 loss = loss + behavior_loss
@@ -162,6 +196,7 @@ class Distillation:
                 self.student.detach_hidden_state(batch.dones.view(-1))
 
         mean_behavior_loss /= cnt
+        mean_gap_sq /= cnt
         self.storage.clear()
         self.last_hidden_states = (self.student.get_hidden_state(), self.teacher.get_hidden_state())
         self.student.detach_hidden_state()
@@ -169,7 +204,31 @@ class Distillation:
         # Construct the loss dictionary
         loss_dict = {"behavior": mean_behavior_loss}
 
-        return loss_dict
+        # Model-owned diagnostics; read off the LAST forward, hence after the loop.
+        info_dict = model_diagnostics(self._raw_student)
+        if std is not None:
+            info_dict["ZDistill/gap_sigma"] = mean_gap_sq**0.5
+
+        return loss_dict, info_dict
+
+    def _frozen_std(self) -> torch.Tensor | None:
+        """The student's per-dim action std as a (1, A) tensor, or None if it has no head.
+
+        Read from the distribution's PARAMETER, not ``output_std``: the latter is the last
+        forward's ``Normal.stddev``, so it carries that batch's shape and would broadcast
+        wrong against a minibatch. Adapter agents freeze std (``learn_std=False``), but this
+        re-reads it per update so a learnable one stays correct.
+        """
+        dist = getattr(self._raw_student, "distribution", None)
+        if dist is None:
+            return None
+        if hasattr(dist, "std_param"):
+            std = dist.std_param.detach()
+        elif hasattr(dist, "log_std_param"):
+            std = dist.log_std_param.detach().exp()
+        else:
+            return None
+        return std.reshape(1, -1)
 
     def train_mode(self) -> None:
         """Set train mode for the student and keep the teacher in eval mode."""
@@ -261,8 +320,20 @@ class Distillation:
         )
         print(f"Teacher Model: {teacher}")
 
-        # Initialize the storage
-        storage = RolloutStorage("distillation", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
+        # Initialize the storage in the STUDENT's layout: a frozen-prefix model may swap raw
+        # inputs for cached derivations (SonicBaseModel.storage_obs replaces the 360-float
+        # tokenizer window with the 64 floats it encodes to, keeping the frozen encoder out
+        # of every update pass). Unlike PPO this needs no dropped-group guard: the STUDENT is
+        # the only model that reads storage. The teacher is evaluated on LIVE observations in
+        # act() and only its action is stored, so a group the student caches away can never
+        # be one the teacher still needs.
+        storage_obs = getattr(student, "storage_obs", lambda o: o)(obs)
+        dropped = set(obs.keys()) - set(storage_obs.keys())
+        if dropped:
+            print(f"[storage] {type(student).__name__} cached prefix: dropped {sorted(dropped)}")
+        storage = RolloutStorage(
+            "distillation", env.num_envs, cfg["num_steps_per_env"], storage_obs, [env.num_actions], device
+        )
 
         # Initialize the algorithm
         alg: Distillation = alg_class(
@@ -271,8 +342,20 @@ class Distillation:
 
         # Compile the algorithm's models if requested
         alg.compile(cfg.get("torch_compile_mode"))
+        alg.set_amp(cfg.get("amp_dtype"))
 
         return alg
+
+    def set_amp(self, dtype: str | None) -> None:
+        """Set the mixed-precision body dtype for the STUDENT — "bfloat16" | "float16" | None.
+
+        The teacher stays fp32 whatever this says, because its action IS the regression
+        target: a bf16 body would perturb the labels rather than the learner, and the
+        student would then be fitting a slightly different teacher than the one that was
+        evaluated. See :meth:`PPO.set_amp` for why the head stays fp32 either way.
+        """
+        self.amp_dtype = resolve_amp_dtype(dtype)
+        set_model_amp(self._raw_student, self.amp_dtype)
 
     def broadcast_parameters(self) -> None:
         """Broadcast model parameters to all GPUs."""

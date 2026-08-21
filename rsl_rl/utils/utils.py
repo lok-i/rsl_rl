@@ -388,3 +388,34 @@ def unpad_trajectories(trajectories: torch.Tensor | TensorDict, masks: torch.Ten
     else:
         # For standard Tensors, we must explicitly handle feature dimensions in view()
         return valid_steps.view(-1, trajectories.shape[0], *trajectories.shape[2:]).transpose(1, 0)
+
+
+def model_diagnostics(model: Any) -> dict[str, float]:
+    """Per-model diagnostics an algorithm folds into its ``info_dict``.
+
+    Two sections, both owned by the MODEL rather than by any algorithm, which is what
+    keeps them comparable across rows that train the same actor with different losses
+    (PPO's ``-Ext`` against a distilled student, say):
+
+    - ``AdapterStats/*``  per-layer LoRA norms (``adapter_diagnostics``).
+    - ``ZAttention/*`` / ``ZCapacity/*``  the extractor's view of its own latent
+      (``extractor.metrics()``, read off the LAST forward — so call this after the
+      update's final minibatch, never before one).
+
+    The extractor emits fully-qualified keys; the group name is folded in only when
+    several extractors are registered (one, the common case, keeps the keys short).
+
+    Pass the UNCOMPILED handle (``_raw_actor`` / ``_raw_student``).
+    """
+    out: dict[str, float] = {}
+    if hasattr(model, "adapter_diagnostics"):
+        out.update(model.adapter_diagnostics())
+    extractors = getattr(model, "extractors", {})
+    for name, extractor in extractors.items():
+        if hasattr(extractor, "metrics"):
+            for key, value in extractor.metrics().items():
+                if len(extractors) > 1:
+                    section, _, leaf = key.partition("/")
+                    key = f"{section}/{name}.{leaf}"
+                out[key] = value
+    return out
