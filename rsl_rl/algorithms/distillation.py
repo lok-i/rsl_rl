@@ -45,6 +45,7 @@ class Distillation:
         learning_rate: float = 1e-3,
         max_grad_norm: float | None = None,
         loss_type: str = "mse",
+        kl_direction: str = "reverse",
         optimizer: str = "adam",
         device: str = "cpu",
         # Distributed training parameters
@@ -88,9 +89,13 @@ class Distillation:
         self.max_grad_norm = max_grad_norm
 
         # Initialize the loss function
+        if kl_direction not in ("forward", "reverse"):
+            raise ValueError(f"kl_direction must be 'forward' or 'reverse', got {kl_direction!r}")
+        self.kl_direction = kl_direction
         loss_fn_dict = {
             "mse": nn.functional.mse_loss,
             "huber": nn.functional.huber_loss,
+            "kl": self._gaussian_kl,
         }
         if loss_type in loss_fn_dict:
             self.loss_fn = loss_fn_dict[loss_type]
@@ -211,6 +216,55 @@ class Distillation:
 
         return loss_dict, info_dict
 
+    def _gaussian_kl(self, actions: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """KL between the student's and teacher's diagonal Gaussians, general form.
+
+            KL(T||S) = sum_j [ log(s_S/s_T) + (s_T^2 + (mu_T - mu_S)^2) / (2 s_S^2) - 1/2 ]
+            KL(S||T) = sum_j [ log(s_T/s_S) + (s_S^2 + (mu_S - mu_T)^2) / (2 s_T^2) - 1/2 ]
+
+        Both sigmas are read from their own model every call rather than assumed equal.
+        They ARE equal today (adapter agents freeze std, and a distilled student inherits
+        its teacher's band -- measured element-wise identical on SONIC), and in that case
+        the log term is 0, the trace term is exactly 1/2, and both directions collapse to
+        the same quadratic sum_j (mu_T - mu_S)^2 / (2 s^2). Reading both anyway is what
+        keeps this correct if a learnable std, a different `std_scale`, or a teacher from
+        another band ever shows up -- the collapse is a property of the checkpoint, not of
+        distillation, and nothing else in the code asserts it.
+
+        `direction` picks the mode-seeking (reverse, "S||T") or mode-covering (forward,
+        "T||S") objective. With equal frozen sigmas they have identical gradients; the
+        choice only bites once the sigmas differ.
+
+        Reduced as sum-over-action-dims then mean-over-batch -- KL is a sum over
+        independent dims, so this is nats per step. NOTE the gradient scale: against
+        `mse` this is ~62x on SONIC (29 dims x 0.5 * mean(1/sigma^2) = 29 x 2.13), so an
+        A/B against an `mse` baseline must scale the learning rate down by that factor or
+        it is an LR experiment wearing a loss experiment's clothes.
+        """
+        std_s = self._std_of(self._raw_student)
+        std_t = self._std_of(self._raw_teacher)
+        if std_s is None or std_t is None:
+            raise ValueError("loss_type='kl' needs both models to carry a distribution.")
+        sq_err = (target - actions).pow(2)
+        if self.kl_direction == "reverse":  # KL(S||T), mode-seeking
+            num, den, log_ratio = std_s.pow(2), std_t.pow(2), torch.log(std_t + 1e-8) - torch.log(std_s + 1e-8)
+        else:                               # KL(T||S), mode-covering
+            num, den, log_ratio = std_t.pow(2), std_s.pow(2), torch.log(std_s + 1e-8) - torch.log(std_t + 1e-8)
+        kl = log_ratio + (num + sq_err) / (2.0 * (den + 1e-7)) - 0.5
+        return kl.sum(dim=-1).mean()
+
+    @staticmethod
+    def _std_of(model: MLPModel) -> torch.Tensor | None:
+        """A model's per-dim action std as (1, A), from the distribution PARAMETER."""
+        dist = getattr(model, "distribution", None)
+        if dist is None:
+            return None
+        if hasattr(dist, "std_param"):
+            return dist.std_param.detach().reshape(1, -1)
+        if hasattr(dist, "log_std_param"):
+            return dist.log_std_param.detach().exp().reshape(1, -1)
+        return None
+
     def _frozen_std(self) -> torch.Tensor | None:
         """The student's per-dim action std as a (1, A) tensor, or None if it has no head.
 
@@ -219,16 +273,7 @@ class Distillation:
         wrong against a minibatch. Adapter agents freeze std (``learn_std=False``), but this
         re-reads it per update so a learnable one stays correct.
         """
-        dist = getattr(self._raw_student, "distribution", None)
-        if dist is None:
-            return None
-        if hasattr(dist, "std_param"):
-            std = dist.std_param.detach()
-        elif hasattr(dist, "log_std_param"):
-            std = dist.log_std_param.detach().exp()
-        else:
-            return None
-        return std.reshape(1, -1)
+        return self._std_of(self._raw_student)
 
     def train_mode(self) -> None:
         """Set train mode for the student and keep the teacher in eval mode."""
