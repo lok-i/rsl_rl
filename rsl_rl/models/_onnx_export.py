@@ -190,9 +190,7 @@ class _OnnxExportBase(nn.Module):
         for port in self._ports:
             if port.name in redirect:
                 continue
-            merged = tuple(
-                g for a, c in redirect.items() if c == port.name for g in by_name[a].groups
-            )
+            merged = tuple(g for a, c in redirect.items() if c == port.name for g in by_name[a].groups)
             kept.append(replace(port, groups=port.groups + merged) if merged else port)
         index = {p.name: i for i, p in enumerate(kept)}
         self._slot_to_port = [index[redirect.get(n, n)] for n in slot_names]
@@ -221,7 +219,4 @@ class _OnnxExportBase(nn.Module):
     @property
     def layout(self) -> list[dict]:
         """Port table for the deploy manifest (names, shapes, source groups)."""
-        return [
-            {"name": p.name, "shape": list(p.shape), "groups": list(p.groups), "term": p.term}
-            for p in self._ports
-        ]
+        return [{"name": p.name, "shape": list(p.shape), "groups": list(p.groups), "term": p.term} for p in self._ports]

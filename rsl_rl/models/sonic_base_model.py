@@ -92,9 +92,7 @@ def fsq_quantize(z: torch.Tensor, levels: torch.Tensor, eps: float = 1e-3) -> to
     return quantized / half_width
 
 
-def _mlp(
-    input_dim: int, hidden_dims: tuple[int, ...] | list[int], output_dim: int, activation: str
-) -> nn.Sequential:
+def _mlp(input_dim: int, hidden_dims: tuple[int, ...] | list[int], output_dim: int, activation: str) -> nn.Sequential:
     """Plain [Linear, Act]*N + Linear stack matching the SONIC BaseModule MLP layout."""
     act_cls = getattr(nn, activation)
     layers: list[nn.Module] = [nn.Linear(input_dim, hidden_dims[0]), act_cls()]
@@ -158,6 +156,19 @@ class SonicBaseModel(AmpMixin, nn.Module):
         """Build the encoder/FSQ/decoder stack; dims inferred from ``obs``.
 
         Args:
+            obs: Observation template used to resolve input widths and export shapes.
+            obs_groups: Observation sets and the flat groups in each set.
+            obs_set: Observation set consumed by the decoder as proprioception.
+            output_dim: Policy output width.
+            tokenizer_obs_group: Flat group consumed by the SONIC encoder.
+            num_tokens: Number of FSQ tokens produced by the encoder.
+            token_dim: Width of each FSQ token.
+            fsq_levels: Codebook levels, scalar or one value per token channel.
+            encoder_hidden_dims: Hidden widths of the checkpoint-compatible encoder.
+            decoder_hidden_dims: Hidden widths of the checkpoint-compatible decoder.
+            activation: PyTorch activation class name used by both MLPs.
+            distribution_cfg: Optional output-distribution configuration.
+            base_checkpoint: Optional ported SONIC checkpoint.
             freeze_base: Freeze the released encoder and decoder weights.
             cache_tokens: Carry the encoder's tokens through the rollout storage rather
                 than recomputing them every update pass. Requires ``freeze_base`` (and, in
@@ -182,9 +193,7 @@ class SonicBaseModel(AmpMixin, nn.Module):
         if isinstance(fsq_levels, int):
             fsq_levels = [fsq_levels] * token_dim
         assert len(fsq_levels) == token_dim, "fsq_levels must have token_dim entries"
-        self.register_buffer(
-            "fsq_levels", torch.tensor(fsq_levels, dtype=torch.long), persistent=False
-        )
+        self.register_buffer("fsq_levels", torch.tensor(fsq_levels, dtype=torch.long), persistent=False)
 
         # Distribution (optional; deterministic when None).
         if distribution_cfg is not None:
@@ -196,9 +205,7 @@ class SonicBaseModel(AmpMixin, nn.Module):
             decoder_output_dim = output_dim
 
         self.encoder = _mlp(tokenizer_dim, encoder_hidden_dims, self.token_total_dim, activation)
-        self.decoder = _mlp(
-            self.token_total_dim + proprio_dim, decoder_hidden_dims, decoder_output_dim, activation
-        )
+        self.decoder = _mlp(self.token_total_dim + proprio_dim, decoder_hidden_dims, decoder_output_dim, activation)
 
         if base_checkpoint is not None:
             payload = torch.load(base_checkpoint, map_location="cpu", weights_only=False)
@@ -206,9 +213,7 @@ class SonicBaseModel(AmpMixin, nn.Module):
             missing, unexpected = self.load_state_dict(state_dict, strict=False)
             missing = [k for k in missing if not k.startswith("distribution")]
             if missing or unexpected:
-                raise RuntimeError(
-                    f"base_checkpoint mismatch: missing={missing}, unexpected={unexpected}"
-                )
+                raise RuntimeError(f"base_checkpoint mismatch: missing={missing}, unexpected={unexpected}")
             # Seed the action std from the ported ckpt's meta — the GEAR ckpt
             # keeps action_std outside the module tree, so load_state_dict
             # can't restore it. Starting at the base's converged per-dim std
@@ -217,9 +222,7 @@ class SonicBaseModel(AmpMixin, nn.Module):
             action_std = payload.get("meta", {}).get("action_std")
             if action_std is not None and self.distribution is not None:
                 std = torch.as_tensor(action_std, dtype=torch.float32)
-                std = std * _std_multiplier(
-                    std_scale, payload.get("meta", {}).get("joint_order"), std.shape[0]
-                )
+                std = std * _std_multiplier(std_scale, payload.get("meta", {}).get("joint_order"), std.shape[0])
                 with torch.no_grad():
                     if hasattr(self.distribution, "std_param"):
                         self.distribution.std_param.copy_(std)
@@ -251,7 +254,7 @@ class SonicBaseModel(AmpMixin, nn.Module):
         a trainable correction, so it must never be baked into the stored tokens.
         ``cond`` is the adapter stream, consumed only by an adapted encoder.
         """
-        if self.cache_tokens and TOKEN_CACHE_KEY in obs.keys():
+        if self.cache_tokens and TOKEN_CACHE_KEY in obs.keys():  # noqa: SIM118 - TensorDict keys
             tokens = obs[TOKEN_CACHE_KEY]
         else:
             z = self._encode_mlp(obs[self.tokenizer_obs_group], cond)
@@ -302,7 +305,9 @@ class SonicBaseModel(AmpMixin, nn.Module):
 
     def _with_tokens(self, obs: TensorDict, tokens: torch.Tensor) -> TensorDict:
         """``obs`` with the tokenizer window replaced by ``tokens`` (a shallow re-select)."""
-        cached = obs.select(*(k for k in obs.keys() if k != self.tokenizer_obs_group))
+        cached = obs.select(
+            *(k for k in obs.keys() if k != self.tokenizer_obs_group)  # noqa: SIM118 - TensorDict keys
+        )
         cached[TOKEN_CACHE_KEY] = tokens
         return cached
 
@@ -330,9 +335,7 @@ class SonicBaseModel(AmpMixin, nn.Module):
             decoded = self._decode(tokens, obs, cond)
         return self._head(self._head_input(decoded), stochastic_output)
 
-    def _decode(
-        self, tokens: torch.Tensor, obs: TensorDict, cond: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    def _decode(self, tokens: torch.Tensor, obs: TensorDict, cond: torch.Tensor | None = None) -> torch.Tensor:
         """Run the decoder over [tokens | proprio]. Adapter variants override this."""
         return self.decoder(torch.cat([tokens, self._get_proprio(obs)], dim=-1))
 
@@ -416,15 +419,12 @@ class _OnnxSonicBaseModel(_OnnxExportBase):
         self.token_dim = model.token_dim
         self.decoder = self._merge_decoder(model)
         self.deterministic_output = (
-            model.distribution.as_deterministic_output_module()
-            if model.distribution is not None
-            else nn.Identity()
+            model.distribution.as_deterministic_output_module() if model.distribution is not None else nn.Identity()
         )
 
         shapes = model.export_shapes
         base_slots = [
-            Port(model.tokenizer_obs_group, shapes[model.tokenizer_obs_group],
-                 (model.tokenizer_obs_group,)),
+            Port(model.tokenizer_obs_group, shapes[model.tokenizer_obs_group], (model.tokenizer_obs_group,)),
             *(Port(g, shapes[g], (g,)) for g in model.obs_groups),
         ]
         self.num_base_inputs = len(base_slots)
@@ -456,8 +456,8 @@ class _OnnxSonicBaseModel(_OnnxExportBase):
         latent = self.encoder(slots[0])
         latent = latent.reshape(latent.shape[0], self.num_tokens, self.token_dim)
         tokens = self.fsq(latent).reshape(latent.shape[0], self.num_tokens * self.token_dim)
-        parts = [tokens, *slots[1:self.num_base_inputs]]
-        adapter_latent = self._adapter_latent(slots[self.num_base_inputs:])
+        parts = [tokens, *slots[1 : self.num_base_inputs]]
+        adapter_latent = self._adapter_latent(slots[self.num_base_inputs :])
         if adapter_latent is not None:
             parts.append(adapter_latent)
         actions = self.deterministic_output(self.decoder(torch.cat(parts, dim=-1)))

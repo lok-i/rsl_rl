@@ -211,9 +211,7 @@ class TestSonicOnnxExport:
         with torch.no_grad():
             reference = model(obs)
             for i in range(NUM_ENVS):
-                inputs = [
-                    torch.as_tensor(_feed(onnx_model, obs, i)[n]) for n in onnx_model.input_names
-                ]
+                inputs = [torch.as_tensor(_feed(onnx_model, obs, i)[n]) for n in onnx_model.input_names]
                 exported = onnx_model(*inputs)
                 if isinstance(exported, tuple):
                     exported = exported[0]

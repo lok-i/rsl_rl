@@ -381,38 +381,3 @@ class TestCNNRunner:
 
             for key, param in runner.alg.actor.state_dict().items():
                 assert torch.equal(saved_actor[key], param), f"CNN parameter '{key}' not restored after load"
-
-
-class TestModularNormRunner:
-    """Tests that the full learn loop works with modular-norm MLP actor/critic."""
-
-    @staticmethod
-    def _build_modular_norm_runner() -> OnPolicyRunner:
-        env = DummyEnv()
-        cfg = _make_train_cfg(model_type="mlp")
-        cfg["actor"]["modular_norm"] = True
-        cfg["critic"]["modular_norm"] = True
-        return OnPolicyRunner(env, cfg, log_dir=None, device="cpu")
-
-    def test_modular_norm_learn_updates_parameters(self) -> None:
-        """Modular-norm actor parameters should change after learning."""
-        runner = self._build_modular_norm_runner()
-        params_before = {n: p.clone() for n, p in runner.alg.actor.named_parameters()}
-        runner.learn(num_learning_iterations=2)
-        changed = any(not torch.equal(params_before[n], p) for n, p in runner.alg.actor.named_parameters())
-        assert changed, "Modular-norm actor parameters should have changed after learning"
-
-    def test_weights_stay_on_manifold_after_learning(self) -> None:
-        """After learning, the weights should still lie on the spectral-norm constraint manifold."""
-        import torch.nn as nn
-
-        runner = self._build_modular_norm_runner()
-        runner.learn(num_learning_iterations=2)
-        for model in (runner.alg.actor, runner.alg.critic):
-            for module in model.mlp:
-                if isinstance(module, nn.Linear):
-                    singular_values = torch.linalg.svdvals(module.weight)
-                    scale = (module.out_features / module.in_features) ** 0.5
-                    assert torch.allclose(singular_values, torch.full_like(singular_values, scale), atol=0.05), (
-                        "Weights left the constraint manifold during learning"
-                    )

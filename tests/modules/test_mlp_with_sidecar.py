@@ -14,7 +14,6 @@ import pytest
 from rsl_rl.modules.mlp import MLP
 from rsl_rl.modules.mlp_with_sidecar import MLPWithSidecar, Sidecar
 
-
 INPUT_DIM = 8
 OUTPUT_DIM = 4
 HIDDEN_DIMS = [16, 16]
@@ -94,7 +93,9 @@ class TestMLPWithSidecar:
         """With condition_on_base_output, sidecar input_dim should include base output_dim."""
         base = MLP(INPUT_DIM, OUTPUT_DIM, HIDDEN_DIMS)
         composed = MLPWithSidecar.from_base_mlp(
-            base, sidecar_input_dim=SIDECAR_INPUT_DIM, condition_on_base_output=True,
+            base,
+            sidecar_input_dim=SIDECAR_INPUT_DIM,
+            condition_on_base_output=True,
         )
         first_linear = next(m for m in composed.sidecar.trunk.modules() if isinstance(m, torch.nn.Linear))
         assert first_linear.in_features == SIDECAR_INPUT_DIM + OUTPUT_DIM
@@ -104,7 +105,9 @@ class TestMLPWithSidecar:
         torch.manual_seed(0)
         base = MLP(INPUT_DIM, OUTPUT_DIM, HIDDEN_DIMS)
         composed = MLPWithSidecar.from_base_mlp(
-            base, sidecar_input_dim=SIDECAR_INPUT_DIM, condition_on_base_output=True,
+            base,
+            sidecar_input_dim=SIDECAR_INPUT_DIM,
+            condition_on_base_output=True,
         )
         x = torch.randn(BATCH, INPUT_DIM)
         sidecar_x = torch.randn(BATCH, SIDECAR_INPUT_DIM)

@@ -65,14 +65,13 @@ class CrossAttentionExtractor(nn.Module):
         self.num_learned_queries = num_learned_queries
         # Per-term token normalizers (shared over P within a term — tokens are a set;
         # separate per term — different sources have different statistics).
-        self.token_normalizers = nn.ModuleDict(
-            {t: EmpiricalNormalization(token_dim) if obs_normalization else nn.Identity() for t in self.token_terms}
-        )
+        self.token_normalizers = nn.ModuleDict({
+            t: EmpiricalNormalization(token_dim) if obs_normalization else nn.Identity() for t in self.token_terms
+        })
         # Per-group query normalizer + projection: one attention row per query group.
-        self.query_normalizers = nn.ModuleDict(
-            {g: EmpiricalNormalization(query_dims[g]) if obs_normalization else nn.Identity()
-             for g in self.query_groups}
-        )
+        self.query_normalizers = nn.ModuleDict({
+            g: EmpiricalNormalization(query_dims[g]) if obs_normalization else nn.Identity() for g in self.query_groups
+        })
         self.w_q = nn.ModuleDict({g: nn.Linear(query_dims[g], attn_dim, bias=False) for g in self.query_groups})
         self.w_k = nn.Linear(token_dim, attn_dim, bias=False)
         self.w_v = nn.Linear(token_dim, attn_dim, bias=False)

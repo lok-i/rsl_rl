@@ -100,13 +100,11 @@ class SonicWithAdapterModel(AdapterStreamMixin, SonicBaseModel):
         return self._get_adapter_latent(obs)
 
     def _encode_mlp(self, x: torch.Tensor, cond: torch.Tensor | None) -> torch.Tensor:
-        """Encoder pass, conditioned on the adapter stream when the encoder is adapted."""
+        """Run the encoder, conditioned on the adapter stream when adapted."""
         return self.encoder(x, cond) if self.adapt_encoder else self.encoder(x)
 
-    def _decode(
-        self, tokens: torch.Tensor, obs: TensorDict, cond: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        """Decoder pass, conditioned on the adapter stream when the decoder is adapted."""
+    def _decode(self, tokens: torch.Tensor, obs: TensorDict, cond: torch.Tensor | None = None) -> torch.Tensor:
+        """Run the decoder, conditioned on the adapter stream when adapted."""
         base_input = torch.cat([tokens, self._get_proprio(obs)], dim=-1)
         if not self.adapt_decoder:
             return self.decoder(base_input)

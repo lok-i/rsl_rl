@@ -10,7 +10,13 @@ from __future__ import annotations
 import torch
 from tensordict import TensorDict
 
-from rsl_rl.modules import EmpiricalNormalization, HiddenState, MLPWithSidecar, ModularNormMLPWithSidecar
+from rsl_rl.modules import (
+    EmpiricalNormalization,
+    HiddenState,
+    MLPWithSidecar,
+    ModularNormMLP,
+    ModularNormMLPWithSidecar,
+)
 
 from .mlp_model import MLPModel
 
@@ -54,6 +60,7 @@ class MLPWithSidecarModel(MLPModel):
         base_checkpoint: str | None = None,
         freeze_base: bool = True,
     ) -> None:
+        """Build the base MLP, load its checkpoint, and attach the sidecar."""
         super().__init__(
             obs=obs,
             obs_groups=obs_groups,
@@ -79,9 +86,7 @@ class MLPWithSidecarModel(MLPModel):
         # Sidecar stream: separate obs group + its own (trainable) normalizer.
         self.sidecar_obs_groups = [sidecar_obs_group]
         sidecar_aug_dim = self._concat_dim(obs, self.sidecar_obs_groups)
-        self.sidecar_normalizer = (
-            EmpiricalNormalization(sidecar_aug_dim) if obs_normalization else torch.nn.Identity()
-        )
+        self.sidecar_normalizer = EmpiricalNormalization(sidecar_aug_dim) if obs_normalization else torch.nn.Identity()
 
         # RPL: sidecar sees full state = base obs (policy) + augmentation obs (object).
         # Each stream is independently normalized before concat.
@@ -119,7 +124,8 @@ class MLPWithSidecarModel(MLPModel):
 
     def _print_param_summary(self, freeze_base: bool) -> None:
         """Pretty-print per-component trainable / total param counts."""
-        def _count(module):
+
+        def _count(module: torch.nn.Module) -> tuple[int, int]:
             total = sum(p.numel() for p in module.parameters())
             train = sum(p.numel() for p in module.parameters() if p.requires_grad)
             return train, total
@@ -129,7 +135,7 @@ class MLPWithSidecarModel(MLPModel):
         print(f"  MLPWithSidecarModel  (base {'frozen' if freeze_base else 'unfrozen'})")
         print(sep)
         print(f"  {'component':<28} {'trainable':>12} {'total':>12}")
-        print(f"  {'─'*28} {'─'*12} {'─'*12}")
+        print(f"  {'─' * 28} {'─' * 12} {'─' * 12}")
 
         grand_train, grand_total = 0, 0
 
@@ -137,28 +143,32 @@ class MLPWithSidecarModel(MLPModel):
         tr, tot = _count(self.mlp.base)
         tag = "frozen" if not tr else ""
         print(f"  base {tag:<22} {tr:>12,} {tot:>12,}")
-        grand_train += tr; grand_total += tot
+        grand_train += tr
+        grand_total += tot
 
         # sidecar
         tr, tot = _count(self.mlp.sidecar)
         print(f"  sidecar{'':19} {tr:>12,} {tot:>12,}")
-        grand_train += tr; grand_total += tot
+        grand_train += tr
+        grand_total += tot
 
         # normalizers
         for name, mod in [("base normalizer", self.obs_normalizer), ("sidecar normalizer", self.sidecar_normalizer)]:
             tr, tot = _count(mod)
             if tot:
                 print(f"  {name:<28} {tr:>12,} {tot:>12,}")
-                grand_train += tr; grand_total += tot
+                grand_train += tr
+                grand_total += tot
 
         # distribution (action std)
         if self.distribution is not None:
             tr, tot = _count(self.distribution)
             if tot:
                 print(f"  {'distribution (std)':<28} {tr:>12,} {tot:>12,}")
-                grand_train += tr; grand_total += tot
+                grand_train += tr
+                grand_total += tot
 
-        print(f"  {'─'*28} {'─'*12} {'─'*12}")
+        print(f"  {'─' * 28} {'─' * 12} {'─' * 12}")
         print(f"  {'TOTAL':<28} {grand_train:>12,} {grand_total:>12,}")
         pct = 100 * grand_train / grand_total if grand_total else 0
         print(f"  trainable: {pct:.1f}%")
@@ -173,6 +183,7 @@ class MLPWithSidecarModel(MLPModel):
         hidden_state: HiddenState = None,
         stochastic_output: bool = False,
     ) -> torch.Tensor:
+        """Run the frozen base and add the sidecar residual."""
         base_latent = self.get_latent(obs, masks, hidden_state)
         sidecar_latent = self._get_sidecar_latent(obs)
         sidecar_input = torch.cat([base_latent, sidecar_latent], dim=-1)
@@ -195,9 +206,11 @@ class MLPWithSidecarModel(MLPModel):
         return {"SidecarStats/head_weight_norm": self.mlp.sidecar.head.weight.norm().item()}
 
     def as_jit(self) -> torch.nn.Module:
+        """Raise because Sidecar JIT export is not implemented."""
         raise NotImplementedError("JIT export for MLPWithSidecarModel is not implemented yet.")
 
     def as_onnx(self, verbose: bool) -> torch.nn.Module:
+        """Raise because Sidecar ONNX export is not implemented."""
         raise NotImplementedError("ONNX export for MLPWithSidecarModel is not implemented yet.")
 
 
@@ -206,6 +219,12 @@ class ModularNormMLPWithSidecarModel(MLPWithSidecarModel):
 
     _sidecar_cls = ModularNormMLPWithSidecar
 
-    def _make_mlp(self, input_dim, output_dim, hidden_dims, activation):
-        from rsl_rl.modules import ModularNormMLP
+    def _make_mlp(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dims: tuple[int, ...] | list[int],
+        activation: str,
+    ) -> ModularNormMLP:
+        """Build the ModularNorm base used by the TextOp Sidecar path."""
         return ModularNormMLP(input_dim, output_dim, hidden_dims, activation)

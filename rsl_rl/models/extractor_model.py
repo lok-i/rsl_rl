@@ -17,22 +17,19 @@ import torch.nn as nn
 from tensordict import TensorDict
 from typing import Any
 
-from rsl_rl.modules import CrossAttentionExtractor, EmpiricalNormalization, HiddenState
+from rsl_rl.modules import CrossAttentionExtractor, EmpiricalNormalization
 from rsl_rl.utils import resolve_callable
 
 from ._onnx_export import Port
-from .mlp_adapter_model import ModularNormMLPWithAdapterModel
-from .mlp_model import MLPModel
 from .sonic_adapter_model import SonicWithAdapterModel, _OnnxSonicAdapterModel
 
 
 def _build_extractors(obs: TensorDict, extractor_cfg: dict[str, dict] | None, extractors: dict | None) -> dict:
     """Build (or validate) one extractor per configured observation group.
 
-    Each per-group cfg may name its extractor class via ``class_name`` (default:
-    :class:`MlpExtractor`); construction goes through the class's ``from_obs``, which sets
-    ``input_groups`` — the group names the extractor consumes. Call sites gather inputs via
-    :func:`_extractor_inputs`.
+    Each per-group cfg names its extractor class via ``class_name``. Construction goes
+    through the class's ``from_obs``, which sets ``input_groups`` — the group names the
+    extractor consumes. Call sites gather inputs via :func:`_extractor_inputs`.
     """
     if extractors is not None:
         return dict(extractors)
@@ -41,7 +38,9 @@ def _build_extractors(obs: TensorDict, extractor_cfg: dict[str, dict] | None, ex
     built = {}
     for group, cfg in extractor_cfg.items():
         cfg = dict(cfg)
-        cls = resolve_callable(cfg.pop("class_name", "rsl_rl.modules.MlpExtractor"))
+        if "class_name" not in cfg:
+            raise ValueError(f"extractor_cfg['{group}'] requires 'class_name'.")
+        cls = resolve_callable(cfg.pop("class_name"))
         built[group] = cls.from_obs(obs, group, **cfg)
     return built
 
@@ -57,101 +56,6 @@ def _print_extractors(extractors: nn.ModuleDict) -> None:
         n_params = sum(p.numel() for p in ext.parameters() if p.requires_grad)
         print(f"  + extractor['{name}']: {n_params:,} trainable params (not in summary above)")
         print("      " + repr(ext).replace("\n", "\n      "))
-
-
-class ExtractorMLPModel(MLPModel):
-    """An :class:`MLPModel` where configured observation groups pass through extractors.
-
-    Groups named in ``extractor_cfg`` are projected by their extractor (own normalizer);
-    the remaining groups follow the plain MLPModel path (shared normalizer, direct concat).
-    """
-
-    def __init__(
-        self,
-        obs: TensorDict,
-        obs_groups: dict[str, list[str]],
-        obs_set: str,
-        output_dim: int,
-        hidden_dims: tuple[int, ...] | list[int] = (256, 256, 256),
-        activation: str = "elu",
-        obs_normalization: bool = False,
-        distribution_cfg: dict | None = None,
-        extractor_cfg: dict[str, dict] | None = None,
-        extractors: dict | None = None,
-    ) -> None:
-        """Initialize the MLP model with per-group extractors (see ``extractor_cfg``)."""
-        # Plain-dict attribute: safe before nn.Module.__init__, registered as ModuleDict after.
-        self._extractors = _build_extractors(obs, extractor_cfg, extractors)
-        super().__init__(
-            obs=obs,
-            obs_groups=obs_groups,
-            obs_set=obs_set,
-            output_dim=output_dim,
-            hidden_dims=hidden_dims,
-            activation=activation,
-            obs_normalization=obs_normalization,
-            distribution_cfg=distribution_cfg,
-        )
-        self.extractors = nn.ModuleDict(self._extractors)
-        _print_extractors(self.extractors)
-
-    # --- overrides ---
-
-    def _get_obs_dim(self, obs: TensorDict, obs_groups: dict[str, list[str]], obs_set: str) -> tuple[list[str], int]:
-        """Split active groups into extracted and plain; report only plain dims to the parent."""
-        active_obs_groups = obs_groups[obs_set]
-        self.extracted_obs_groups = [g for g in active_obs_groups if g in self._extractors]
-        if not self.extracted_obs_groups:
-            raise ValueError(
-                f"None of the active observation groups {active_obs_groups} has an extractor. "
-                "Use MLPModel instead if this is intentional."
-            )
-        plain_groups = [g for g in active_obs_groups if g not in self._extractors]
-        obs_dim = 0
-        for g in plain_groups:
-            if len(obs[g].shape) != 2:
-                raise ValueError(f"The MLP model only supports 1D observations, got {obs[g].shape} for '{g}'.")
-            obs_dim += obs[g].shape[-1]
-        return plain_groups, obs_dim
-
-    def _get_latent_dim(self) -> int:
-        """Return the latent dimensionality consumed by the MLP head."""
-        return self.obs_dim + sum(self._extractors[g].latent_dim for g in self.extracted_obs_groups)
-
-    def get_latent(
-        self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
-    ) -> torch.Tensor:
-        """Build the model latent from extractor latents and plain normalized groups."""
-        latent_ext = self.encode(obs)
-        if not self.obs_groups:
-            return latent_ext
-        return torch.cat([super().get_latent(obs), latent_ext], dim=-1)
-
-    def update_normalization(self, obs: TensorDict) -> None:
-        """Update plain-group and extractor normalization statistics."""
-        if self.obs_groups:
-            super().update_normalization(obs)
-        for g in self.extracted_obs_groups:
-            self.extractors[g].update_normalization(*_extractor_inputs(self.extractors[g], obs, g))
-
-    # --- aux interface ---
-
-    def encode(self, obs: TensorDict) -> torch.Tensor:
-        """Concatenated extractor latents (the representation shared with auxiliary objectives)."""
-        return torch.cat(
-            [self.extractors[g](*_extractor_inputs(self.extractors[g], obs, g)) for g in self.extracted_obs_groups],
-            dim=-1,
-        )
-
-    # --- export (not supported yet) ---
-
-    def as_jit(self) -> nn.Module:
-        """Return a version of the model compatible with Torch JIT export."""
-        raise NotImplementedError("JIT export for ExtractorMLPModel is not implemented yet.")
-
-    def as_onnx(self, verbose: bool = False) -> nn.Module:
-        """Return a version of the model compatible with ONNX export."""
-        raise NotImplementedError("ONNX export for ExtractorMLPModel is not implemented yet.")
 
 
 class ExtractedAdapterStreamMixin:
@@ -237,10 +141,6 @@ class ExtractedAdapterStreamMixin:
         )
 
 
-class ExtractorAdapterModel(ExtractedAdapterStreamMixin, ModularNormMLPWithAdapterModel):
-    """A :class:`ModularNormMLPWithAdapterModel` whose adapter stream is extractor-fed."""
-
-
 class ExtractorSonicAdapterModel(ExtractedAdapterStreamMixin, SonicWithAdapterModel):
     """A :class:`SonicWithAdapterModel` whose adapter stream is extractor-fed."""
 
@@ -279,9 +179,7 @@ class _OnnxCrossAttention(nn.Module):
         self.w_k = copy.deepcopy(extractor.w_k)
         self.w_v = copy.deepcopy(extractor.w_v)
         self.learned_queries = (
-            None
-            if extractor.learned_queries is None
-            else nn.Parameter(extractor.learned_queries.detach().clone())
+            None if extractor.learned_queries is None else nn.Parameter(extractor.learned_queries.detach().clone())
         )
         self.proj = copy.deepcopy(extractor.proj)
         self.out_norm = copy.deepcopy(extractor.out_norm)
@@ -292,25 +190,18 @@ class _OnnxCrossAttention(nn.Module):
         """Pool the token inputs under every query row; returns ``(latent, attention)``."""
         token_inputs = inputs[: self.num_token_inputs]
         query_inputs = inputs[self.num_token_inputs :]
-        tokens = torch.cat(
-            [norm(x) for norm, x in zip(self.token_normalizers, token_inputs)], dim=1
-        )
+        tokens = torch.cat([norm(x) for norm, x in zip(self.token_normalizers, token_inputs)], dim=1)
         keys, values = self.w_k(tokens), self.w_v(tokens)
-        rows = [
-            w_q(norm(qv)).unsqueeze(1)
-            for w_q, norm, qv in zip(self.w_q, self.query_normalizers, query_inputs)
-        ]
+        rows = [w_q(norm(qv)).unsqueeze(1) for w_q, norm, qv in zip(self.w_q, self.query_normalizers, query_inputs)]
         q = torch.cat(rows, dim=1)
         if self.learned_queries is not None:
-            q = torch.cat(
-                [q, self.learned_queries.unsqueeze(0).expand(tokens.shape[0], -1, -1)], dim=1
-            )
+            q = torch.cat([q, self.learned_queries.unsqueeze(0).expand(tokens.shape[0], -1, -1)], dim=1)
         attn = torch.softmax(q @ keys.transpose(-2, -1) / self.attn_scale, dim=-1)
         return self.out_norm(self.proj((attn @ values).flatten(1))), attn
 
 
 class _OnnxFlatExtractor(nn.Module):
-    """Export copy of a single-flat-group extractor (e.g. :class:`MlpExtractor`)."""
+    """Export copy of an extractor that consumes one tensor observation group."""
 
     def __init__(self, extractor: nn.Module) -> None:
         """Deep-copy the extractor; the tuple return keeps the caller uniform."""
@@ -318,7 +209,7 @@ class _OnnxFlatExtractor(nn.Module):
         self.extractor = copy.deepcopy(extractor)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
-        """Project the feature group to its latent (no attention map)."""
+        """Project the feature group to its latent without an attention output."""
         return self.extractor(x), None
 
 
@@ -330,10 +221,7 @@ def _wrap_extractor(extractor: nn.Module, group: str, shapes: dict) -> tuple[nn.
     luck), each query group is one flat input.
     """
     if isinstance(extractor, CrossAttentionExtractor):
-        ports = [
-            Port(f"{group}__{term}", shapes[group][term], (group,), term=term)
-            for term in extractor.token_terms
-        ]
+        ports = [Port(f"{group}__{term}", shapes[group][term], (group,), term=term) for term in extractor.token_terms]
         ports += [Port(g, shapes[g], (g,)) for g in extractor.query_groups]
         return _OnnxCrossAttention(extractor), ports
     if getattr(extractor, "term_keys", None) is None and not isinstance(shapes[group], dict):
@@ -350,8 +238,7 @@ class _OnnxExtractorSonicAdapterModel(_OnnxSonicAdapterModel):
     backbone stays outside — deployment streams its tokens in on the ``kv_tokens__*`` ports.
     """
 
-    def __init__(self, model: ExtractorSonicAdapterModel, verbose: bool = False,
-                 with_attn: bool = True) -> None:
+    def __init__(self, model: ExtractorSonicAdapterModel, verbose: bool = False, with_attn: bool = True) -> None:
         """Build the export copy; ``with_attn`` exposes the attention map as an extra output."""
         self.with_attn = with_attn
         super().__init__(model, verbose)
@@ -363,15 +250,11 @@ class _OnnxExtractorSonicAdapterModel(_OnnxSonicAdapterModel):
         self.extractors = nn.ModuleList()
         self.extractor_input_counts: list[int] = []
         for group in model.extracted_adapter_groups:
-            wrapper, extractor_ports = _wrap_extractor(
-                model.extractors[group], group, model.export_shapes
-            )
+            wrapper, extractor_ports = _wrap_extractor(model.extractors[group], group, model.export_shapes)
             self.extractors.append(wrapper)
             self.extractor_input_counts.append(len(extractor_ports))
             ports += extractor_ports
-        self.num_attn_outputs = sum(
-            isinstance(e, _OnnxCrossAttention) for e in self.extractors
-        )
+        self.num_attn_outputs = sum(isinstance(e, _OnnxCrossAttention) for e in self.extractors)
         self.with_attn = self.with_attn and self.num_attn_outputs > 0
         return ports
 

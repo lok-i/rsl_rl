@@ -10,6 +10,7 @@ import copy
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
+from typing import Any
 
 from rsl_rl.modules import MLP, AmpMixin, EmpiricalNormalization, HiddenState, ModularNormMLP
 from rsl_rl.modules.distribution import Distribution
@@ -75,7 +76,13 @@ class MLPModel(AmpMixin, nn.Module):
         # MLP (subclasses override _make_mlp to change the MLP type)
         self.mlp = self._make_mlp(self._get_latent_dim(), mlp_output_dim, hidden_dims, activation)
 
-    def _make_mlp(self, input_dim: int, output_dim: int, hidden_dims, activation: str) -> MLP:
+    def _make_mlp(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dims: tuple[int, ...] | list[int],
+        activation: str,
+    ) -> MLP:
         """Build and initialize the MLP. Subclasses override to change the MLP type."""
         mlp = MLP(input_dim, output_dim, hidden_dims, activation)
         if self.distribution is not None:
@@ -205,11 +212,18 @@ class ModularNormMLPModel(MLPModel):
     ``project_weights``).
     """
 
-    def _make_mlp(self, input_dim: int, output_dim: int, hidden_dims, activation: str) -> ModularNormMLP:
+    def _make_mlp(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dims: tuple[int, ...] | list[int],
+        activation: str,
+    ) -> ModularNormMLP:
         """Build a ModularNormMLP. Skips distribution weight init (manifold has its own)."""
         return ModularNormMLP(input_dim, output_dim, hidden_dims, activation)
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Initialize the MLP and expose its modular-norm optimizer hooks."""
         super().__init__(*args, **kwargs)
         self.dualize_gradients = self.mlp.dualize_gradients
         self.project_weights = self.mlp.project_weights

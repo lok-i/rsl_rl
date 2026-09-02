@@ -12,7 +12,6 @@ from tensordict import TensorDict
 
 from rsl_rl.models.mlp_sidecar_model import MLPWithSidecarModel
 
-
 NUM_ENVS = 4
 OBS_DIM = 8
 AUG_DIM = 6
@@ -47,7 +46,10 @@ def _make_model(**kwargs: object) -> tuple[MLPWithSidecarModel, TensorDict]:
     }
     defaults.update(kwargs)
     model = MLPWithSidecarModel(
-        obs, OBS_GROUPS, "actor", NUM_ACTIONS,
+        obs,
+        OBS_GROUPS,
+        "actor",
+        NUM_ACTIONS,
         sidecar_obs_group="augmentation",
         **defaults,
     )
@@ -93,9 +95,9 @@ class TestMLPWithSidecarModelForward:
         assert not torch.isnan(out).any()
 
     def test_backward_produces_gradients(self) -> None:
-        """Backward should produce gradients for sidecar and distribution params only."""
+        """Backward through the deterministic action should reach only the sidecar."""
         model, obs = _make_model()
-        out = model(obs, stochastic_output=True)
+        out = model(obs)
         out.sum().backward()
         # Sidecar should have gradients
         sidecar_grads = [p.grad for p in model.mlp.sidecar.parameters() if p.grad is not None]
@@ -107,7 +109,7 @@ class TestMLPWithSidecarModelForward:
     def test_no_nan_in_backward(self) -> None:
         """Gradients should not be NaN."""
         model, obs = _make_model()
-        out = model(obs, stochastic_output=True)
+        out = model(obs)
         out.sum().backward()
         for p in model.parameters():
             if p.grad is not None:
@@ -119,7 +121,7 @@ class TestMLPWithSidecarModelNormalization:
 
     def test_update_normalization_only_updates_sidecar(self) -> None:
         """update_normalization should only change the sidecar normalizer stats."""
-        model, obs = _make_model(obs_normalization=True)
+        model, _ = _make_model(obs_normalization=True)
         model.train()
 
         base_mean_before = model.obs_normalizer._mean.clone()

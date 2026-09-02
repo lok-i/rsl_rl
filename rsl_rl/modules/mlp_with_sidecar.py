@@ -55,6 +55,7 @@ class Sidecar(nn.Module):
         output_scale: float = 1.0,
         output_bound: str | None = None,
     ) -> None:
+        """Build the residual trunk and near-zero output head."""
         super().__init__()
         # Legacy compat: float output_bound (e.g. 1.0) → absorb into scale, set bound="tanh".
         if isinstance(output_bound, (int, float)):
@@ -141,6 +142,7 @@ class MLPWithSidecar(nn.Module):
         condition_on_base_output: bool = False,
         freeze_base: bool = True,
     ) -> None:
+        """Build the base MLP and attach its output Sidecar."""
         super().__init__()
         base = self.base_mlp_class(input_dim, output_dim, hidden_dims, activation, last_activation)
         self._set_base(base, freeze_base)
@@ -213,8 +215,13 @@ class MLPWithSidecar(nn.Module):
         if self.condition_on_base_output:
             sidecar_input_dim += output_dim
         self.sidecar = Sidecar(
-            sidecar_input_dim, output_dim, sidecar_hidden_dims, sidecar_activation,
-            head_init_gain, output_scale, output_bound,
+            sidecar_input_dim,
+            output_dim,
+            sidecar_hidden_dims,
+            sidecar_activation,
+            head_init_gain,
+            output_scale,
+            output_bound,
         )
 
     def forward(self, obs: torch.Tensor, sidecar_obs: torch.Tensor | None = None) -> torch.Tensor:

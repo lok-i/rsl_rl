@@ -78,8 +78,7 @@ class StateFdAux(AuxObjective):
             **kwargs,
         )
         assert 1 <= self.unroll_steps <= storage.num_transitions_per_env - 1, (
-            f"StateFdAux window ({self.unroll_steps}) must fit the rollout "
-            f"({storage.num_transitions_per_env} steps)."
+            f"StateFdAux window ({self.unroll_steps}) must fit the rollout ({storage.num_transitions_per_env} steps)."
         )
         self.autoregress = autoregress
         self.start_with_current_step = start_with_current_step
@@ -198,9 +197,7 @@ class StateFdAux(AuxObjective):
             # spread keeps moving as the policy changes what it produces. A slice whose raw
             # error tripled can log a flat curve if sigma tripled with it. Logging sigma
             # makes the curve readable: fd_l1 * ruler ~ the error in raw units.
-            metrics["ZPrediction/ruler"] = (
-                self.target_normalizer.std + self.target_normalizer.eps
-            ).mean().item()
+            metrics["ZPrediction/ruler"] = (self.target_normalizer.std + self.target_normalizer.eps).mean().item()
             # Early/late halves WITHIN each window: early rides the window seed (dead
             # reckoning), late is image-corrected only — the image-dependence diagnostic.
             if self.unroll_steps >= 2:
@@ -313,9 +310,7 @@ class StateFdAux(AuxObjective):
         )
         out: dict[str, float] = {}
         for mode in modes:
-            sh_losses, _, _ = self._scan(
-                target, self._shuffle_z(z, mode), cond, not_done, actions, starts
-            )
+            sh_losses, _, _ = self._scan(target, self._shuffle_z(z, mode), cond, not_done, actions, starts)
             shuffled = torch.stack(sh_losses).mean()
             out[f"ZPrediction/shuffled_{mode}"] = shuffled.item()
             out[f"ZPrediction/gain_{mode}"] = (shuffled - loss).item()

@@ -129,8 +129,12 @@ class LatentFdAux(AuxObjective):
         return loss, metrics
 
     def _encode_span(
-        self, flat: dict[str, torch.Tensor], idx: torch.Tensor, num_envs: int,
-        steps: int, extractor: nn.Module | None = None,
+        self,
+        flat: dict[str, torch.Tensor],
+        idx: torch.Tensor,
+        num_envs: int,
+        steps: int,
+        extractor: nn.Module | None = None,
     ) -> torch.Tensor:
         """Encode ``steps`` consecutive offsets of ``idx`` in one pass -> ``(steps, mb, latent)``.
 

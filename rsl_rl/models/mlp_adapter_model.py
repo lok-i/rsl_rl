@@ -28,13 +28,9 @@ class AdapterStreamMixin:
         """The :class:`MLPWithAdapter` carrying the LoRA adapters. Override per host."""
         return self.mlp  # type: ignore[attr-defined]
 
-    def _init_adapter_stream(
-        self, obs: TensorDict, adapter_obs_group: str | list[str], obs_normalization: bool
-    ) -> int:
+    def _init_adapter_stream(self, obs: TensorDict, adapter_obs_group: str | list[str], obs_normalization: bool) -> int:
         """Set up the adapter stream (groups + normalizer); returns its effective dim."""
-        self.adapter_obs_groups = (
-            [adapter_obs_group] if isinstance(adapter_obs_group, str) else list(adapter_obs_group)
-        )
+        self.adapter_obs_groups = [adapter_obs_group] if isinstance(adapter_obs_group, str) else list(adapter_obs_group)
         adapter_dim = self._concat_dim(obs, self.adapter_obs_groups)
         self.adapter_normalizer = EmpiricalNormalization(adapter_dim) if obs_normalization else torch.nn.Identity()
         return adapter_dim
@@ -63,6 +59,7 @@ class AdapterStreamMixin:
 
     def _print_param_summary(self, freeze_base: bool) -> None:
         """Pretty-print per-component trainable / total param counts."""
+
         def _count(module: torch.nn.Module) -> tuple[int, int]:
             total = sum(p.numel() for p in module.parameters())
             train = sum(p.numel() for p in module.parameters() if p.requires_grad)
@@ -172,9 +169,9 @@ class MLPWithAdapterModel(AdapterStreamMixin, MLPModel):
             payload = torch.load(base_checkpoint, map_location="cpu", weights_only=False)
             is_ported = isinstance(payload, dict) and "model_state_dict" in payload
             state_dict = payload["model_state_dict"] if is_ported else payload
-            _, unexpected = self.load_state_dict(state_dict, strict=False)
-            if unexpected:
-                raise RuntimeError(f"base_checkpoint has unexpected keys: {unexpected}")
+            missing, unexpected = self.load_state_dict(state_dict, strict=False)
+            if missing or unexpected:
+                raise RuntimeError(f"base_checkpoint mismatch: missing={missing}, unexpected={unexpected}")
 
         # Adapter stream: separate obs group + its own (trainable) normalizer.
         adapter_dim = self._init_adapter_stream(obs, adapter_obs_group, obs_normalization)
@@ -230,4 +227,5 @@ class ModularNormMLPWithAdapterModel(MLPWithAdapterModel):
     ) -> ModularNormMLP:  # noqa: F821
         """Build a ModularNormMLP base (matches the pretrained checkpoint's layer type)."""
         from rsl_rl.modules import ModularNormMLP
+
         return ModularNormMLP(input_dim, output_dim, hidden_dims, activation)

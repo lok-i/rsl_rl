@@ -178,7 +178,9 @@ class MLPWithAdapter(nn.Module):
                 linear.out_features,
                 ranks[i],
                 alpha,
-            ) if ranks[i] is not None else None
+            )
+            if ranks[i] is not None
+            else None
             for i, linear in enumerate(self.base_linears)
         )
 

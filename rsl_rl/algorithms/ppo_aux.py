@@ -78,20 +78,17 @@ class PPOAux(PPO):
         extractor_params = [p for enc in self._raw_actor.extractors.values() for p in enc.parameters()]
         extractor_ids = {id(p) for p in extractor_params}
         rest = [
-            p for p in chain(self._raw_actor.parameters(), self._raw_critic.parameters())
-            if id(p) not in extractor_ids
+            p for p in chain(self._raw_actor.parameters(), self._raw_critic.parameters()) if id(p) not in extractor_ids
         ]
         if aux_mode == "joint":
             # One optimizer, one Adam per param; aux head params join it (their own aux Adam
             # from _finalize goes unused). Encoder LR defaults to the aux LR.
             aux_params = [p for p in self.aux.parameters() if p.requires_grad]
-            self.optimizer = type(self.optimizer)(
-                [
-                    {"params": rest, "lr": self.learning_rate},
-                    {"params": extractor_params, "lr": extractor_lr or self.aux.learning_rate, "fixed_lr": True},
-                    {"params": aux_params, "lr": self.aux.learning_rate, "fixed_lr": True},
-                ]
-            )
+            self.optimizer = type(self.optimizer)([
+                {"params": rest, "lr": self.learning_rate},
+                {"params": extractor_params, "lr": extractor_lr or self.aux.learning_rate, "fixed_lr": True},
+                {"params": aux_params, "lr": self.aux.learning_rate, "fixed_lr": True},
+            ])
         elif not extractor_in_ppo or extractor_lr is not None:
             groups = [{"params": rest, "lr": self.learning_rate}]
             if extractor_in_ppo:
@@ -112,7 +109,8 @@ class PPOAux(PPO):
         # Live per-source gradients + the pre-step weights of the CURRENT minibatch; consumed
         # and cleared in _post_optimizer_step, so nothing here survives into the next one.
         self._g: dict[str, list[torch.Tensor | None]] = {
-            "ppo": [None] * len(extractor_params), "aux": [None] * len(extractor_params)
+            "ppo": [None] * len(extractor_params),
+            "aux": [None] * len(extractor_params),
         }
         self._theta_before: list[torch.Tensor | None] = [None] * len(extractor_params)
         self._pass_marker = extractor_params[0] if extractor_params else None
@@ -157,9 +155,7 @@ class PPOAux(PPO):
         # identical to backpropagating the summed loss, but separately phase-tagged.
         (self.aux_weight * loss).backward()
         self._grad_phase = "ppo"
-        nn.utils.clip_grad_norm_(
-            [p for p in self.aux.parameters() if p.requires_grad], self.aux.max_grad_norm
-        )
+        nn.utils.clip_grad_norm_([p for p in self.aux.parameters() if p.requires_grad], self.aux.max_grad_norm)
         # Pre-step weights for the pull attribution — taken here, after both backwards and
         # before the clip + optimizer step, so Delta-theta is the fully realized motion.
         with torch.no_grad():
