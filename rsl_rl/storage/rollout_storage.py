@@ -138,12 +138,19 @@ class RolloutStorage:
         self.num_envs = num_envs
         self.actions_shape = actions_shape
 
-        # Core
+        # Core. Nested groups (concatenate_terms=False -> a TensorDict of terms) recurse:
+        # their .shape is the batch size, not a leaf shape.
+        def _zeros_stacked(value: torch.Tensor | TensorDict) -> torch.Tensor | TensorDict:
+            if isinstance(value, TensorDict):
+                return TensorDict(
+                    {key: _zeros_stacked(term) for key, term in value.items()},
+                    batch_size=[num_transitions_per_env, *value.batch_size],
+                    device=device,
+                )
+            return torch.zeros(num_transitions_per_env, *value.shape, dtype=value.dtype, device=device)
+
         self.observations = TensorDict(
-            {
-                key: torch.zeros(num_transitions_per_env, *value.shape, dtype=value.dtype, device=device)
-                for key, value in obs.items()
-            },
+            {key: _zeros_stacked(value) for key, value in obs.items()},
             batch_size=[num_transitions_per_env, num_envs],
             device=self.device,
         )
@@ -289,7 +296,8 @@ class RolloutStorage:
                 # take a batch of trajectories and finally reshape back to [num_layers, batch, hidden_dim]
                 if self.saved_hidden_state_a is not None:
                     hidden_state_a_batch = [
-                        saved_hidden_state.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
+                        saved_hidden_state
+                        .permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
                         .transpose(1, 0)
                         .contiguous()
                         for saved_hidden_state in self.saved_hidden_state_a
@@ -302,7 +310,8 @@ class RolloutStorage:
                     hidden_state_a_batch = None
                 if self.saved_hidden_state_c is not None:
                     hidden_state_c_batch = [
-                        saved_hidden_state.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
+                        saved_hidden_state
+                        .permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
                         .transpose(1, 0)
                         .contiguous()
                         for saved_hidden_state in self.saved_hidden_state_c

@@ -31,6 +31,7 @@ class MLP(nn.Sequential):
         hidden_dims: tuple[int, ...] | list[int],
         activation: str = "elu",
         last_activation: str | None = None,
+        bias: bool = True,
     ) -> None:
         """Initialize the MLP.
 
@@ -41,6 +42,7 @@ class MLP(nn.Sequential):
                 inferred from the input dimension.
             activation: Activation function.
             last_activation: Activation function of the last layer. None results in a linear last layer.
+            bias: Whether the linear layers learn an additive bias.
         """
         super().__init__()
 
@@ -52,21 +54,23 @@ class MLP(nn.Sequential):
 
         # Create layers sequentially
         layers = []
-        layers.append(nn.Linear(input_dim, hidden_dims_processed[0]))
+        layers.append(nn.Linear(input_dim, hidden_dims_processed[0], bias=bias))
         layers.append(activation_mod)
 
         for layer_index in range(len(hidden_dims_processed) - 1):
-            layers.append(nn.Linear(hidden_dims_processed[layer_index], hidden_dims_processed[layer_index + 1]))
+            layers.append(
+                nn.Linear(hidden_dims_processed[layer_index], hidden_dims_processed[layer_index + 1], bias=bias)
+            )
             layers.append(activation_mod)
 
         # Add last layer
         if isinstance(output_dim, int):
-            layers.append(nn.Linear(hidden_dims_processed[-1], output_dim))
+            layers.append(nn.Linear(hidden_dims_processed[-1], output_dim, bias=bias))
         else:
             # Compute the total output dimension
             total_out_dim = reduce(lambda x, y: x * y, output_dim)
             # Add a layer to reshape the output to the desired shape
-            layers.append(nn.Linear(hidden_dims_processed[-1], total_out_dim))
+            layers.append(nn.Linear(hidden_dims_processed[-1], total_out_dim, bias=bias))
             layers.append(nn.Unflatten(dim=-1, unflattened_size=output_dim))
 
         # Add last activation function if specified
@@ -86,7 +90,8 @@ class MLP(nn.Sequential):
         for idx, module in enumerate(self):
             if isinstance(module, nn.Linear):
                 nn.init.orthogonal_(module.weight, gain=get_param(scales, idx))
-                nn.init.zeros_(module.bias)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass of the MLP."""

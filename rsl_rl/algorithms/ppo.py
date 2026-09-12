@@ -14,6 +14,7 @@ from tensordict import TensorDict
 from rsl_rl.env import VecEnv
 from rsl_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import MLPModel
+from rsl_rl.modules import resolve_amp_dtype, set_model_amp
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
 
@@ -121,9 +122,17 @@ class PPO:
         self.transition.values = self.critic(obs).detach()
         self.transition.actions_log_prob = self.actor.get_output_log_prob(self.transition.actions).detach()  # type: ignore
         self.transition.distribution_params = tuple(p.detach() for p in self.actor.output_distribution_params)
-        # Record observations before env.step()
-        self.transition.observations = obs
+        # Record observations before env.step(), in the actor's storage layout: a model with a
+        # frozen prefix swaps the raw inputs for the values it just derived from them, so the
+        # update reads the cached result instead of recomputing a pure function (see
+        # SonicBaseModel.storage_obs). Identity for models without the hook.
+        self.transition.observations = self._cache_obs(obs)
         return self.transition.actions  # type: ignore
+
+    def _cache_obs(self, obs: TensorDict) -> TensorDict:
+        """Storage layout carrying this step's cached derivations (identity without the hook)."""
+        hook = getattr(self._raw_actor, "cache_obs", None)
+        return hook(obs) if hook is not None else obs
 
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
@@ -187,7 +196,39 @@ class PPO:
         if not self.normalize_advantage_per_mini_batch:
             st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
 
+    def set_amp(self, dtype: str | None) -> None:
+        """Set the mixed-precision body dtype — "bfloat16" | "float16" | None (off).
+
+        Delegates to the MODELS (:class:`~rsl_rl.modules.AmpMixin`) rather than wrapping
+        ``update()``, for two reasons that are the whole difference between bf16 working
+        and bf16 collapsing:
+
+        1. **The head stays fp32.** Autocasting all of ``update()`` computes ``logp``,
+           the ratio, the KL and the value loss in bf16. Measured on the SONIC actor,
+           the head alone accounts for a 1.9x reduction in log-prob error; the value
+           loss is worse still, since returns are O(10-100) where bf16 resolves ~0.8.
+        2. **Collection and update use the same kernels.** A dtype that applies only to
+           ``update()`` recomputes ``logp`` in bf16 against an fp32 ``logp_old``, so the
+           ratio is wrong at epoch 0 before any learning has happened.
+
+        Watch ``Diagnostics/logp_drift_mb0``. Measured on SONIC + 8k envs: ~4e-6 in fp32,
+        ~5e-2 in bf16. That floor is irreducible — bf16 reproduces the action mean only to
+        ~1.2e-3 across batch shapes, and log-prob amplifies that by ``sqrt(dim)/sigma``.
+        It costs ~0.25% of extra surrogate variance and ~1.4% of the KL target, both
+        benign; ~1e-1 or above means the head is leaking again.
+
+        bf16 needs no loss scaling; fp16 would (not wired) — but fp16's 10-bit mantissa
+        would cut the drift ~4x if the backward turns out not to underflow.
+        """
+        self.amp_dtype = resolve_amp_dtype(dtype)
+        for model in (self._raw_actor, self._raw_critic):
+            set_model_amp(model, self.amp_dtype)
+
     def update(self) -> dict[str, float]:
+        """Run optimization epochs (the models carry their own autocast; see set_amp)."""
+        return self._update()
+
+    def _update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
         mean_value_loss = 0
         mean_surrogate_loss = 0
@@ -196,6 +237,8 @@ class PPO:
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
+        # Precision-seam probe, filled on the first minibatch only (see the surrogate below)
+        logp_drift: torch.Tensor | None = None
 
         # Get mini-batch generator
         if self.actor.is_recurrent or self.critic.is_recurrent:
@@ -254,12 +297,19 @@ class PPO:
                         torch.distributed.broadcast(lr_tensor, src=0)
                         self.learning_rate = lr_tensor.item()
 
-                    # Update the learning rate for all parameter groups
+                    # Update the learning rate for all parameter groups (fixed-LR groups keep theirs)
                     for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
+                        if not param_group.get("fixed_lr", False):
+                            param_group["lr"] = self.learning_rate
 
             # Surrogate loss
-            ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore
+            log_ratio = actions_log_prob - torch.squeeze(batch.old_actions_log_prob)  # type: ignore
+            if logp_drift is None:
+                # First minibatch of the first epoch: the weights have not moved yet, so this
+                # SHOULD be ~0. Anything else is a precision seam between collection and the
+                # update (see PPO.set_amp) putting noise straight onto the clipped ratio.
+                logp_drift = log_ratio.detach().abs().mean()
+            ratio = torch.exp(log_ratio)
             surrogate = -torch.squeeze(batch.advantages) * ratio  # type: ignore
             surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(  # type: ignore
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
@@ -289,6 +339,9 @@ class PPO:
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
             loss.backward()
+            # Extension seam: subclasses may accumulate extra gradients into the same step
+            # (e.g. PPOAux joint mode — equivalent to loss += extra, but separately tagged).
+            self._extra_backward()
             # Compute the gradients for RND
             if self.rnd:
                 self.rnd.optimizer.zero_grad()
@@ -299,9 +352,21 @@ class PPO:
                 self.reduce_parameters()
 
             # Apply the gradients for PPO
-            nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-            nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+            # Note: Modular-norm models dualize their gradients instead of clipping them and project their weights
+            # back onto the constraint manifold after the optimizer step.
+            for model in (self.actor, self.critic):
+                if hasattr(model, "dualize_gradients"):
+                    model.dualize_gradients()
+                else:
+                    nn.utils.clip_grad_norm_(model.parameters(), self.max_grad_norm)
             self.optimizer.step()
+            for model in (self.actor, self.critic):
+                if hasattr(model, "project_weights"):
+                    model.project_weights()
+            # Extension seam: subclasses may inspect the REALIZED parameter delta of this
+            # minibatch (post-clip, post-Adam, post-projection) — e.g. PPOAux attributing
+            # the step to its gradient sources.
+            self._post_optimizer_step()
             # Apply the gradients for RND
             if self.rnd:
                 self.rnd.optimizer.step()
@@ -338,10 +403,41 @@ class PPO:
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
 
+        # Adapter diagnostics: per-layer norms (separate from losses)
+        info_dict = {}
+        if hasattr(self.actor, "adapter_diagnostics"):
+            info_dict.update(self.actor.adapter_diagnostics())
+        if logp_drift is not None:
+            info_dict["Diagnostics/logp_drift_mb0"] = logp_drift.item()
+
+        # Extractor-owned diagnostics (ZAttention/*, ZCapacity/*). Drained here in the
+        # BASE algorithm, not in PPOAux, so the extractor-only row (plain PPO, no
+        # auxiliary objective) reports them as well — it is the baseline the aux rows
+        # are compared against, and it is why these two sections are the ONLY ones
+        # comparable across -Ext / -Sfd / -Lfd. The extractor emits fully-qualified
+        # keys; the group name is folded in only when several extractors are registered
+        # (one, the common case, keeps the keys short).
+        extractors = getattr(self._raw_actor, "extractors", {})
+        for name, extractor in extractors.items():
+            if hasattr(extractor, "metrics"):
+                for key, value in extractor.metrics().items():
+                    if len(extractors) > 1:
+                        section, _, leaf = key.partition("/")
+                        key = f"{section}/{name}.{leaf}"
+                    info_dict[key] = value
+
         # Clear the storage
         self.storage.clear()
 
-        return loss_dict
+        return loss_dict, info_dict
+
+    def _extra_backward(self) -> None:
+        """Accumulate extra per-minibatch gradients before the optimizer step. No-op for PPO."""
+        pass
+
+    def _post_optimizer_step(self) -> None:
+        """Inspect the realized parameter delta after the optimizer step. No-op for PPO."""
+        pass
 
     def train_mode(self) -> None:
         """Set train mode for learnable models."""
@@ -436,14 +532,28 @@ class PPO:
         critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
         print(f"Critic Model: {critic}")
 
-        # Initialize the storage
-        storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
+        # Initialize the storage, in the actor's layout (a frozen-prefix model may swap raw
+        # inputs for cached derivations). Guard: never drop a group another stream still reads
+        # — the actor cannot see the critic's or the aux objective's groups.
+        storage_obs = getattr(actor, "storage_obs", lambda o: o)(obs)
+        dropped = set(obs.keys()) - set(storage_obs.keys())
+        if dropped:
+            claimed = {g for groups in cfg["obs_groups"].values() for g in groups}
+            conflict = dropped & claimed
+            if conflict:
+                raise ValueError(
+                    f"{type(actor).__name__}.storage_obs drops {sorted(conflict)}, but "
+                    f"obs_groups still routes them to a model. Set cache_tokens=False."
+                )
+            print(f"[storage] {type(actor).__name__} cached prefix: dropped {sorted(dropped)}")
+        storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], storage_obs, [env.num_actions], device)
 
         # Initialize the algorithm
         alg: PPO = alg_class(actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])
 
         # Compile the algorithm's models if requested
         alg.compile(cfg.get("torch_compile_mode"))
+        alg.set_amp(cfg.get("amp_dtype"))
 
         return alg
 

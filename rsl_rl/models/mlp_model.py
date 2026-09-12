@@ -10,13 +10,14 @@ import copy
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
+from typing import Any
 
-from rsl_rl.modules import MLP, EmpiricalNormalization, HiddenState
+from rsl_rl.modules import MLP, AmpMixin, EmpiricalNormalization, HiddenState, ModularNormMLP
 from rsl_rl.modules.distribution import Distribution
 from rsl_rl.utils import resolve_callable, unpad_trajectories
 
 
-class MLPModel(nn.Module):
+class MLPModel(AmpMixin, nn.Module):
     """MLP-based neural model.
 
     This model uses a simple multi-layer perceptron (MLP) to process 1D observation groups. Observations can be
@@ -72,12 +73,21 @@ class MLPModel(nn.Module):
             self.distribution = None
             mlp_output_dim = output_dim
 
-        # MLP
-        self.mlp = MLP(self._get_latent_dim(), mlp_output_dim, hidden_dims, activation)
+        # MLP (subclasses override _make_mlp to change the MLP type)
+        self.mlp = self._make_mlp(self._get_latent_dim(), mlp_output_dim, hidden_dims, activation)
 
-        # Initialize distribution-specific MLP weights
+    def _make_mlp(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dims: tuple[int, ...] | list[int],
+        activation: str,
+    ) -> MLP:
+        """Build and initialize the MLP. Subclasses override to change the MLP type."""
+        mlp = MLP(input_dim, output_dim, hidden_dims, activation)
         if self.distribution is not None:
-            self.distribution.init_mlp_weights(self.mlp)
+            self.distribution.init_mlp_weights(mlp)
+        return mlp
 
     def forward(
         self,
@@ -95,10 +105,11 @@ class MLPModel(nn.Module):
         """
         # If observations are padded for recurrent training but the model is non-recurrent, unpad the observations
         obs = unpad_trajectories(obs, masks) if masks is not None and not self.is_recurrent else obs
-        # Get MLP input latent
-        latent = self.get_latent(obs, masks, hidden_state)
-        # MLP forward pass
-        mlp_output = self.mlp(latent)
+        # Body under autocast (no-op unless set_amp_dtype was called); head always fp32 (see AmpMixin)
+        with self._amp_body():
+            latent = self.get_latent(obs, masks, hidden_state)
+            mlp_output = self.mlp(latent)
+        mlp_output = self._head_input(mlp_output)
         # If stochastic output is requested, update the distribution and sample from it, otherwise return MLP output
         if self.distribution is not None:
             if stochastic_output:
@@ -191,6 +202,31 @@ class MLPModel(nn.Module):
     def _get_latent_dim(self) -> int:
         """Return the latent dimensionality consumed by the MLP head."""
         return self.obs_dim
+
+
+class ModularNormMLPModel(MLPModel):
+    """An :class:`MLPModel` whose MLP is a :class:`~rsl_rl.modules.ModularNormMLP`.
+
+    The learning algorithm dualizes the gradients and projects the weights onto the spectral-norm
+    constraint manifold instead of clipping gradients (duck-typed via ``dualize_gradients`` /
+    ``project_weights``).
+    """
+
+    def _make_mlp(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dims: tuple[int, ...] | list[int],
+        activation: str,
+    ) -> ModularNormMLP:
+        """Build a ModularNormMLP. Skips distribution weight init (manifold has its own)."""
+        return ModularNormMLP(input_dim, output_dim, hidden_dims, activation)
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Initialize the MLP and expose its modular-norm optimizer hooks."""
+        super().__init__(*args, **kwargs)
+        self.dualize_gradients = self.mlp.dualize_gradients
+        self.project_weights = self.mlp.project_weights
 
 
 class _TorchMLPModel(nn.Module):
